@@ -29,3 +29,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# Local work notes
+CODEx_WORK.md
