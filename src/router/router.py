@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from jarvis_contracts import (
+    ConversationMode as ContractConversationMode,
     ConversationRequest,
     ConversationResponse,
     ErrorResponse,
@@ -20,6 +21,7 @@ from jarvis_contracts import (
     VerifyRequest,
 )
 
+from jarvis_contracts import DeepThinkResponse
 from planner.conversation_orchestrator import orchestrate_conversation_turn
 from planner.executor import SUPPORTED_ACTIONS, run_execute, run_verify
 from planner.conversation_routing import (
@@ -152,6 +154,8 @@ def _stream_orchestrated_conversation(
     _log_classification(req.message, decision.mode, decision.confidence)
 
     category = "general" if decision.mode == ConversationMode.REALTIME else "deep"
+    request_id = request.headers.get("x-request-id", "")
+
     yield _sse_event(
         "classification",
         {
@@ -162,50 +166,145 @@ def _stream_orchestrated_conversation(
         },
     )
 
-    if decision.mode != ConversationMode.REALTIME:
-        yield _sse_event(
-            "thinking",
-            {
-                "text": "DeepThinking...",
-                "mode": decision.mode.value,
-            },
+    # ── realtime: 바로 core에 위임 ─────────────────────────
+    if decision.mode == ConversationMode.REALTIME:
+        stream = request.app.state.core_client.chat_stream(
+            message=req.message,
+            task_type="general",
+            confirm=False,
+            route_override="realtime",
+            user_id=principal.user_id,
+            user_email=getattr(principal, "email", ""),
+            request_id=request_id,
         )
-        plan = build_plan(req.message)
-        for step in plan.steps:
-            logger.info("deep-thinking plan step title=%s", step.title)
-            yield _sse_event(
-                "plan_step",
-                {
-                    "id": step.id,
-                    "title": step.title,
-                    "description": step.description,
-                    "status": "in_progress",
-                },
-            )
+        for chunk in stream:
+            yield chunk
+        return
 
+    # ── deep / planning: 깊은 생각 흐름 ───────────────────
+    yield _sse_event(
+        "thinking",
+        {"text": "조금 더 생각중...", "mode": decision.mode.value},
+    )
+
+    # AI 기반 플래닝 (core의 deep model 사용)
+    try:
+        plan_result = request.app.state.core_client.deepthink_plan(
+            request_id=request_id,
+            message=req.message,
+            user_id=principal.user_id,
+        )
+    except Exception as exc:
+        logger.error("deepthink plan failed, falling back to rule-based: %s", exc)
+        # fallback: 규칙 기반 플래닝
+        fallback_plan = build_plan(req.message)
+        plan_result = type("PlanResult", (), {
+            "goal": fallback_plan.goal,
+            "steps": [
+                type("Step", (), {"id": s.id, "title": s.title, "description": s.description})()
+                for s in fallback_plan.steps
+            ],
+            "constraints": fallback_plan.constraints,
+        })()
+
+    # 플랜 요약을 클라이언트에 전송
+    plan_summary = "\n".join(
+        f"{idx}. {step.title}: {step.description}"
+        for idx, step in enumerate(plan_result.steps, start=1)
+    )
+    yield _sse_event(
+        "plan_summary",
+        {
+            "goal": plan_result.goal,
+            "total_steps": len(plan_result.steps),
+            "summary": plan_summary,
+            "constraints": getattr(plan_result, "constraints", []),
+        },
+    )
+
+    # planning 모드면 플랜만 전달하고 종료
     if decision.mode == ConversationMode.PLANNING:
-        plan = build_plan(req.message)
-        summary = "\n".join(f"{index}. {step.description}" for index, step in enumerate(plan.steps, start=1))
         yield _sse_event(
             "assistant_done",
-            {
-                "content": f"{plan.goal}\n\n{summary}".strip(),
-            },
+            {"content": f"{plan_result.goal}\n\n{plan_summary}".strip()},
         )
         return
 
-    route_override = "deep" if decision.mode == ConversationMode.DEEP else "realtime"
-    stream = request.app.state.core_client.chat_stream(
-        message=req.message,
-        task_type="analysis" if decision.mode == ConversationMode.DEEP else "general",
-        confirm=False,
-        route_override=route_override,
-        user_id=principal.user_id,
-        user_email=getattr(principal, "email", ""),
-        request_id=request.headers.get("x-request-id", ""),
-    )
-    for chunk in stream:
-        yield chunk
+    # ── deep 모드: 각 단계를 core에 실행 위임 ──────────────
+    plan_step_payloads = [
+        {"id": step.id, "title": step.title, "description": step.description}
+        for step in plan_result.steps
+    ]
+
+    # 각 단계 진행 상황을 클라이언트에 알림
+    for step in plan_result.steps:
+        yield _sse_event(
+            "plan_step",
+            {
+                "id": step.id,
+                "title": step.title,
+                "description": step.description,
+                "status": "in_progress",
+            },
+        )
+
+    # core에 deepthink 실행 요청
+    try:
+        result = request.app.state.core_client.deepthink_execute(
+            request_id=request_id,
+            message=req.message,
+            plan_steps=plan_step_payloads,
+            user_id=principal.user_id,
+        )
+
+        # 각 단계별 결과 + 단계별 actions를 클라이언트에 전송
+        for step_result in result.steps:
+            step_actions = [a.model_dump() for a in step_result.actions]
+            yield _sse_event(
+                "plan_step",
+                {
+                    "id": step_result.step_id,
+                    "title": step_result.title,
+                    "description": step_result.content[:200],
+                    "status": step_result.status,
+                    "actions": step_actions,
+                },
+            )
+
+        # 전체 actions를 별도 이벤트로 전송 — 클라이언트가 순서대로 실행 가능
+        if result.actions:
+            yield _sse_event(
+                "actions",
+                {
+                    "request_id": request_id,
+                    "total": len(result.actions),
+                    "items": [a.model_dump() for a in result.actions],
+                },
+            )
+
+        yield _sse_event(
+            "assistant_done",
+            {
+                "content": result.content,
+                "summary": result.summary,
+                "has_actions": len(result.actions) > 0,
+                "action_count": len(result.actions),
+            },
+        )
+    except Exception as exc:
+        logger.error("deepthink execute failed: %s", exc)
+        # fallback: deep 모드로 chat_stream 사용
+        stream = request.app.state.core_client.chat_stream(
+            message=req.message,
+            task_type="analysis",
+            confirm=False,
+            route_override="deep",
+            user_id=principal.user_id,
+            user_email=getattr(principal, "email", ""),
+            request_id=request_id,
+        )
+        for chunk in stream:
+            yield chunk
 
 
 # ── health ──────────────────────────────────────────────────
@@ -303,9 +402,12 @@ def respond(
     authorization_header: AuthHeaderDoc = None,
 ) -> ConversationResponse:
     _ = authorization_header
+    core_client = request.app.state.core_client
+    request_id = request.headers.get("x-request-id", "")
+
     result = orchestrate_conversation_turn(
         req.message,
-        core_client=request.app.state.core_client,
+        core_client=core_client,
         override=req.override.value if req.override else None,
         context=ConversationContext(
             recent_failures=req.recent_failures,
@@ -313,7 +415,10 @@ def respond(
             turn_index=req.turn_index,
         ),
     )
+
     planning = None
+    actions_list: list[dict[str, object]] = []
+
     if result.planning_result is not None:
         planning = PlanningPayload(
             goal=result.planning_result.goal,
@@ -330,6 +435,51 @@ def respond(
             exit_condition=result.planning_result.exit_condition,
             notes=result.planning_result.notes,
         )
+
+    # deep 모드: AI 플래닝 → 실행 → actions 수집
+    if result.decision.mode == ConversationMode.DEEP:
+        try:
+            principal = request.state.principal
+            plan_resp = core_client.deepthink_plan(
+                request_id=request_id,
+                message=req.message,
+                user_id=principal.user_id,
+            )
+            planning = PlanningPayload(
+                goal=plan_resp.goal,
+                constraints=plan_resp.constraints,
+                steps=[
+                    PlanStepPayload(
+                        id=s.id, title=s.title, description=s.description, status="pending"
+                    )
+                    for s in plan_resp.steps
+                ],
+                exit_condition="all steps executed",
+                notes=[],
+            )
+            exec_resp = core_client.deepthink_execute(
+                request_id=request_id,
+                message=req.message,
+                plan_steps=[
+                    {"id": s.id, "title": s.title, "description": s.description}
+                    for s in plan_resp.steps
+                ],
+                user_id=principal.user_id,
+            )
+            return ConversationResponse(
+                mode=result.decision.mode,
+                triggered=result.decision.triggered,
+                confidence=result.decision.confidence,
+                reasons=result.decision.reasons,
+                handler="jarvis-core",
+                content=exec_resp.content,
+                summary=exec_resp.summary,
+                next_actions=[],
+                planning=planning,
+                actions=list(exec_resp.actions),
+            )
+        except Exception as exc:
+            logger.error("respond deepthink failed, using orchestrator result: %s", exc)
 
     content = result.core_result.content if result.core_result else None
     summary = result.core_result.summary if result.core_result else None
@@ -398,6 +548,51 @@ def chat_request(
     return ChatResponse(**result)
 
 
+def _stream_chat_with_routing(
+    req: ChatRequest,
+    request: Request,
+    principal,
+) -> Generator[bytes, None, None]:
+    """chat/stream에서도 auto일 때 conversation routing을 적용한다."""
+    request_id = request.headers.get("x-request-id", "")
+
+    if req.thinking_mode != "auto":
+        # 명시적 모드 지정 → core에 바로 위임
+        yield from request.app.state.core_client.chat_stream(
+            message=req.message,
+            task_type=req.task_type,
+            confirm=req.confirm,
+            route_override=req.thinking_mode,
+            user_id=principal.user_id,
+            user_email=getattr(principal, "email", ""),
+            request_id=request_id,
+        )
+        return
+
+    # auto 모드: conversation routing으로 분류
+    decision = evaluate_conversation_mode(req.message)
+    _log_classification(req.message, decision.mode, decision.confidence)
+
+    if decision.mode == ConversationMode.REALTIME:
+        yield from request.app.state.core_client.chat_stream(
+            message=req.message,
+            task_type=req.task_type,
+            confirm=req.confirm,
+            route_override="realtime",
+            user_id=principal.user_id,
+            user_email=getattr(principal, "email", ""),
+            request_id=request_id,
+        )
+        return
+
+    # deep / planning → 깊은 생각 흐름을 ConversationRequest로 위임
+    conv_req = ConversationRequest(
+        message=req.message,
+        override=ContractConversationMode(decision.mode.value),
+    )
+    yield from _stream_orchestrated_conversation(conv_req, request, principal)
+
+
 @api_router.post("/chat/stream", tags=["chat"], summary="Stream chat response")
 def chat_stream(
     req: ChatRequest,
@@ -408,15 +603,7 @@ def chat_stream(
     _ = authorization_header
     principal = request.state.principal
     return StreamingResponse(
-        request.app.state.core_client.chat_stream(
-            message=req.message,
-            task_type=req.task_type,
-            confirm=req.confirm,
-            route_override=None if req.thinking_mode == "auto" else req.thinking_mode,
-            user_id=principal.user_id,
-            user_email=getattr(principal, "email", ""),
-            request_id=request.headers.get("x-request-id", ""),
-        ),
+        _stream_chat_with_routing(req, request, principal),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

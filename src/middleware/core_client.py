@@ -8,7 +8,12 @@ from collections.abc import Generator
 from dataclasses import dataclass, field
 
 from fastapi import HTTPException, status
-from jarvis_contracts import InternalConversationResponse, JarvisCoreEndpoints
+from jarvis_contracts import (
+    DeepThinkPlanResponse,
+    DeepThinkResponse,
+    InternalConversationResponse,
+    JarvisCoreEndpoints,
+)
 
 
 @dataclass(slots=True)
@@ -237,6 +242,43 @@ class CoreClient:
             extra_headers={"x-user-id": user_id},
         )
         return result if isinstance(result, list) else []
+
+    # ── deepthink ───────────────────────────────────────────
+
+    def deepthink_plan(
+        self,
+        *,
+        request_id: str,
+        message: str,
+        user_id: str,
+    ) -> DeepThinkPlanResponse:
+        raw = self._request_json(
+            JarvisCoreEndpoints.INTERNAL_DEEPTHINK_PLAN.method,
+            JarvisCoreEndpoints.INTERNAL_DEEPTHINK_PLAN.path,
+            body={"request_id": request_id, "message": message},
+            extra_headers={"x-user-id": user_id, "x-request-id": request_id},
+        )
+        return DeepThinkPlanResponse.model_validate(raw)
+
+    def deepthink_execute(
+        self,
+        *,
+        request_id: str,
+        message: str,
+        plan_steps: list[dict[str, str]],
+        user_id: str,
+    ) -> DeepThinkResponse:
+        raw = self._request_json(
+            JarvisCoreEndpoints.INTERNAL_DEEPTHINK_EXECUTE.method,
+            JarvisCoreEndpoints.INTERNAL_DEEPTHINK_EXECUTE.path,
+            body={
+                "request_id": request_id,
+                "message": message,
+                "plan_steps": plan_steps,
+            },
+            extra_headers={"x-user-id": user_id, "x-request-id": request_id},
+        )
+        return DeepThinkResponse.model_validate(raw)
 
     # ── common HTTP ─────────────────────────────────────────
 
