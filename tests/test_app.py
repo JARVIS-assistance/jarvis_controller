@@ -1,5 +1,5 @@
 from fastapi.testclient import TestClient
-from jarvis_contracts import JarvisCoreEndpoints
+from jarvis_contracts import ClientAction, JarvisCoreEndpoints
 
 from jarvis_controller.app import create_app
 from jarvis_controller.middleware.core_client import CoreResponse
@@ -334,6 +334,46 @@ def test_execute_mock_success() -> None:
     payload = response.json()
     assert payload["success"] is True
     assert payload["output"]["mock"] is True
+
+
+def test_client_action_pending_and_result_endpoints() -> None:
+    envelope = client.app.state.action_dispatcher.enqueue(
+        user_id="u1",
+        request_id="req-client-action",
+        action=ClientAction(
+            type="browser_control",
+            command="scroll",
+            target="active_tab",
+            args={"direction": "down", "amount": "page"},
+            description="현재 브라우저 페이지를 아래로 스크롤",
+            requires_confirm=False,
+        ),
+    )
+
+    pending_response = client.get(
+        "/client/actions/pending",
+        headers=auth_headers(),
+    )
+
+    assert pending_response.status_code == 200
+    pending = pending_response.json()
+    assert pending[0]["action_id"] == envelope.action_id
+    assert pending[0]["action"]["type"] == "browser_control"
+
+    result_response = client.post(
+        f"/client/actions/{envelope.action_id}/result",
+        json={
+            "status": "completed",
+            "output": {"scroll_y": 1200},
+            "contract_version": "1.0",
+        },
+        headers=auth_headers(),
+    )
+
+    assert result_response.status_code == 200
+    result = result_response.json()
+    assert result["status"] == "completed"
+    assert result["output"]["scroll_y"] == 1200
 
 
 def test_verify_mock_success() -> None:

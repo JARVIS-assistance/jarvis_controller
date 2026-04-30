@@ -1,13 +1,27 @@
 import logging
+from pathlib import Path
 
 from fastapi import FastAPI
 
 from middleware.core_client import CoreClient
 from middleware.auth_middleware import GatewayAuthMiddleware
 from middleware.gateway_client import GatewayClient
+from planner.action_context import ActionContextStore
+from planner.action_dispatcher import ActionDispatcher
 from router.router import api_router
 
 logging.basicConfig(level=logging.INFO)
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover
+    load_dotenv = None
+
+if load_dotenv is not None:
+    repo_root = Path(__file__).resolve().parents[2]
+    for env_path in (repo_root / ".env", repo_root / "jarvis_controller" / ".env"):
+        if env_path.exists():
+            load_dotenv(env_path, override=False)
 
 
 API_DESCRIPTION = """
@@ -71,6 +85,9 @@ def create_app(
     )
     app.state.gateway_client = gateway_client or GatewayClient()
     app.state.core_client = core_client or CoreClient()
+    app.state.action_dispatcher = ActionDispatcher()
+    app.state.action_context = ActionContextStore()
+    app.state.action_dispatcher.context_store = app.state.action_context
     app.add_middleware(GatewayAuthMiddleware, gateway_client=app.state.gateway_client)
     app.include_router(api_router)
     return app

@@ -2,12 +2,15 @@ import json
 import logging
 from collections.abc import Generator
 from typing import Annotated, Literal, Optional
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from jarvis_contracts import (
+    ClientAction,
+    ClientActionResultRequest,
     ConversationMode as ContractConversationMode,
     ConversationRequest,
     ConversationResponse,
@@ -29,6 +32,8 @@ from planner.conversation_routing import (
     ConversationMode,
     evaluate_conversation_mode,
 )
+from planner.client_action_intents import infer_client_actions
+from planner.dom_link_resolver import resolve_link_from_dom_output
 from planner.planning_engine import build_plan
 
 logger = logging.getLogger("jarvis_controller")
@@ -137,6 +142,282 @@ def _log_classification(message: str, mode: ConversationMode, confidence: float)
     )
 
 
+def _stream_with_model_logging(
+    stream: Generator[bytes, None, None],
+    *,
+    request_id: str,
+    message: str,
+) -> Generator[bytes, None, None]:
+    event_name: str | None = None
+    data_lines: list[str] = []
+    logged = False
+
+    for chunk in stream:
+        yield chunk
+        try:
+            line = chunk.decode("utf-8").rstrip("\r\n")
+        except UnicodeDecodeError:
+            continue
+
+        if line.startswith("event:"):
+            event_name = line.split(":", 1)[1].strip()
+            data_lines = []
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line.split(":", 1)[1].strip())
+            continue
+        if line != "" or event_name != "meta" or logged:
+            continue
+
+        try:
+            payload = json.loads("\n".join(data_lines))
+        except json.JSONDecodeError:
+            event_name = None
+            data_lines = []
+            continue
+
+        logger.info(
+            "conversation model selected request_id=%s route=%s provider=%s/%s model=%s message=%s",
+            request_id,
+            payload.get("route"),
+            payload.get("provider_mode"),
+            payload.get("provider_name"),
+            payload.get("model_name"),
+            message[:200],
+        )
+        logged = True
+        event_name = None
+        data_lines = []
+
+
+def _format_action_context(
+    *,
+    action: ClientAction,
+    status: str,
+    output: dict[str, object],
+    error: str | None,
+) -> str:
+    return (
+        f"[클라이언트 실행: {action.type}/{action.command or ''} ({status})]\n"
+        f"설명: {action.description}\n"
+        f"결과: {json.dumps(output, ensure_ascii=False)}\n"
+        f"오류: {error or ''}"
+    )
+
+
+def _fallback_client_actions(
+    message: str,
+    *,
+    request: Request | None = None,
+    user_id: str | None = None,
+) -> list[ClientAction]:
+    context: dict[str, object] = {}
+    if request is not None and user_id:
+        store = getattr(request.app.state, "action_context", None)
+        browser_context = (
+            store.browser_context(user_id)
+            if store is not None and hasattr(store, "browser_context")
+            else None
+        )
+        if browser_context is not None:
+            context = {
+                "browser_active": True,
+                "last_query": browser_context.last_query,
+                "last_url": browser_context.last_url,
+            }
+    return infer_client_actions(message, context=context or None)
+
+
+def _action_result_payload(envelope, action_result, action: ClientAction) -> dict[str, object]:
+    return {
+        "action_id": envelope.action_id,
+        "request_id": envelope.request_id,
+        "status": action_result.status,
+        "output": action_result.output,
+        "error": action_result.error,
+        "action": action.model_dump(),
+    }
+
+
+def _stream_dispatched_actions(
+    *,
+    actions: list[ClientAction],
+    request_id: str,
+    user_id: str,
+    action_dispatcher,
+    done_content: str,
+    done_summary: str,
+) -> Generator[bytes, None, None]:
+    action_results: list[dict[str, object]] = []
+    pending_actions = list(actions)
+    while pending_actions:
+        action = pending_actions.pop(0)
+        envelope = action_dispatcher.enqueue(
+            user_id=user_id,
+            request_id=request_id,
+            action=action,
+        )
+        yield _sse_event("action_dispatch", envelope.model_dump())
+        action_result = action_dispatcher.wait_for_result(
+            action_id=envelope.action_id,
+            request_id=request_id,
+        )
+        action_payload = _action_result_payload(envelope, action_result, action)
+        action_results.append(action_payload)
+        yield _sse_event("action_result", action_payload)
+        _record_action_context(
+            action_dispatcher=action_dispatcher,
+            user_id=user_id,
+            action=action,
+            status=action_result.status,
+            output=action_result.output,
+        )
+        follow_up = _follow_up_action_from_result(
+            action,
+            status=action_result.status,
+            output=action_result.output,
+        )
+        if follow_up is not None:
+            pending_actions.append(follow_up)
+
+    yield _sse_event(
+        "actions",
+        {
+            "request_id": request_id,
+            "total": len(action_results),
+            "items": [
+                item["action"]
+                for item in action_results
+                if isinstance(item.get("action"), dict)
+            ],
+            "results": action_results,
+        },
+    )
+
+
+def _record_action_context(
+    *,
+    action_dispatcher,
+    user_id: str,
+    action: ClientAction,
+    status: str,
+    output: dict[str, object],
+) -> None:
+    store = getattr(action_dispatcher, "context_store", None)
+    if store is None:
+        return
+    store.record_action_result(
+        user_id=user_id,
+        action=action,
+        status=status,
+        output=output,
+    )
+    yield _sse_event(
+        "assistant_done",
+        {
+            "content": done_content,
+            "summary": done_summary,
+            "has_actions": True,
+            "action_count": len(action_results),
+            "action_results": action_results,
+        },
+    )
+
+
+def _follow_up_action_from_result(
+    action: ClientAction,
+    *,
+    status: str,
+    output: dict[str, object],
+) -> ClientAction | None:
+    if status != "completed":
+        return None
+    if action.type != "browser_control" or action.command != "extract_dom":
+        return None
+    if not isinstance(action.args, dict):
+        return None
+    if action.args.get("purpose") != "resolve_open_request":
+        return None
+    raw_query = action.args.get("query")
+    if not isinstance(raw_query, str) or not raw_query.strip():
+        return None
+    resolved = resolve_link_from_dom_output(output, query=raw_query)
+    if resolved is None:
+        return None
+    return ClientAction(
+        type="open_url",
+        command=None,
+        target=resolved.href,
+        args={"browser": "chrome"},
+        description=f"현재 페이지에서 '{raw_query}'에 가장 가까운 링크 열기: {resolved.title or resolved.href}",
+        requires_confirm=False,
+    )
+
+
+def _execute_deepthink_steps(
+    *,
+    core_client,
+    action_dispatcher,
+    request_id: str,
+    message: str,
+    plan_steps,
+    user_id: str,
+) -> tuple[list, str, str, list[ClientAction], list[dict[str, object]]]:
+    step_results = []
+    all_actions: list[ClientAction] = []
+    action_results: list[dict[str, object]] = []
+    execution_context: list[str] = []
+
+    for step in plan_steps:
+        exec_resp = core_client.deepthink_execute(
+            request_id=request_id,
+            message=message,
+            plan_steps=[
+                {"id": step.id, "title": step.title, "description": step.description}
+            ],
+            user_id=user_id,
+            execution_context=execution_context,
+        )
+        step_results.extend(exec_resp.steps)
+
+        pending_actions = list(exec_resp.actions)
+        while pending_actions:
+            action = pending_actions.pop(0)
+            all_actions.append(action)
+            envelope, result = action_dispatcher.dispatch_and_wait(
+                user_id=user_id,
+                request_id=request_id,
+                action=action,
+            )
+            dumped = _action_result_payload(envelope, result, action)
+            action_results.append(dumped)
+            execution_context.append(
+                _format_action_context(
+                    action=action,
+                    status=result.status,
+                    output=result.output,
+                    error=result.error,
+                )
+            )
+            follow_up = _follow_up_action_from_result(
+                action,
+                status=result.status,
+                output=result.output,
+            )
+            if follow_up is not None:
+                pending_actions.append(follow_up)
+
+        for step_result in exec_resp.steps:
+            execution_context.append(
+                f"- {step_result.title}: {step_result.content[:500]}"
+            )
+
+    completed = [s for s in step_results if s.status == "completed"]
+    summary = f"{len(completed)}/{len(step_results)} 단계 완료"
+    content = "\n\n".join(f"### {s.title}\n{s.content}" for s in step_results)
+    return step_results, summary, content, all_actions, action_results
+
+
 def _stream_orchestrated_conversation(
     req: ConversationRequest,
     request: Request,
@@ -154,7 +435,7 @@ def _stream_orchestrated_conversation(
     _log_classification(req.message, decision.mode, decision.confidence)
 
     category = "general" if decision.mode == ConversationMode.REALTIME else "deep"
-    request_id = request.headers.get("x-request-id", "")
+    request_id = request.headers.get("x-request-id") or f"req_{uuid4().hex}"
 
     yield _sse_event(
         "classification",
@@ -165,6 +446,26 @@ def _stream_orchestrated_conversation(
             "reasons": decision.reasons,
         },
     )
+
+    direct_actions = _fallback_client_actions(
+        req.message,
+        request=request,
+        user_id=principal.user_id,
+    )
+    if direct_actions and decision.mode != ConversationMode.PLANNING:
+        yield _sse_event(
+            "thinking",
+            {"text": "브라우저 제어 액션을 준비중...", "mode": decision.mode.value},
+        )
+        yield from _stream_dispatched_actions(
+            actions=direct_actions,
+            request_id=request_id,
+            user_id=principal.user_id,
+            action_dispatcher=request.app.state.action_dispatcher,
+            done_content="브라우저 제어 액션을 실행 요청했습니다.",
+            done_summary="direct client action dispatched",
+        )
+        return
 
     # ── realtime: 바로 core에 위임 ─────────────────────────
     if decision.mode == ConversationMode.REALTIME:
@@ -177,7 +478,11 @@ def _stream_orchestrated_conversation(
             user_email=getattr(principal, "email", ""),
             request_id=request_id,
         )
-        for chunk in stream:
+        for chunk in _stream_with_model_logging(
+            stream,
+            request_id=request_id,
+            message=req.message,
+        ):
             yield chunk
         return
 
@@ -230,12 +535,6 @@ def _stream_orchestrated_conversation(
         )
         return
 
-    # ── deep 모드: 각 단계를 core에 실행 위임 ──────────────
-    plan_step_payloads = [
-        {"id": step.id, "title": step.title, "description": step.description}
-        for step in plan_result.steps
-    ]
-
     # 각 단계 진행 상황을 클라이언트에 알림
     for step in plan_result.steps:
         yield _sse_event(
@@ -248,51 +547,127 @@ def _stream_orchestrated_conversation(
             },
         )
 
-    # core에 deepthink 실행 요청
+    # core에 step 단위로 실행 요청하고 결과를 다음 step context로 주입
     try:
-        result = request.app.state.core_client.deepthink_execute(
-            request_id=request_id,
-            message=req.message,
-            plan_steps=plan_step_payloads,
-            user_id=principal.user_id,
-        )
+        step_results = []
+        all_actions = []
+        action_results = []
+        execution_context: list[str] = []
 
-        # 각 단계별 결과 + 단계별 actions를 클라이언트에 전송
-        for step_result in result.steps:
-            step_actions = [a.model_dump() for a in step_result.actions]
-            yield _sse_event(
-                "plan_step",
-                {
-                    "id": step_result.step_id,
-                    "title": step_result.title,
-                    "description": step_result.content[:200],
-                    "status": step_result.status,
-                    "actions": step_actions,
-                },
+        for step in plan_result.steps:
+            result = request.app.state.core_client.deepthink_execute(
+                request_id=request_id,
+                message=req.message,
+                plan_steps=[
+                    {
+                        "id": step.id,
+                        "title": step.title,
+                        "description": step.description,
+                    }
+                ],
+                user_id=principal.user_id,
+                execution_context=execution_context,
             )
 
-        # 전체 actions를 별도 이벤트로 전송 — 클라이언트가 순서대로 실행 가능
-        if result.actions:
+            for step_result in result.steps:
+                step_results.append(step_result)
+                yield _sse_event(
+                    "plan_step",
+                    {
+                        "id": step_result.step_id,
+                        "title": step_result.title,
+                        "description": step_result.content[:200],
+                        "status": step_result.status,
+                        "actions": [a.model_dump() for a in step_result.actions],
+                    },
+                )
+
+            pending_actions = list(result.actions)
+            while pending_actions:
+                action = pending_actions.pop(0)
+                all_actions.append(action)
+                envelope = request.app.state.action_dispatcher.enqueue(
+                    user_id=principal.user_id,
+                    request_id=request_id,
+                    action=action,
+                )
+                yield _sse_event(
+                    "action_dispatch",
+                    envelope.model_dump(),
+                )
+                action_result = request.app.state.action_dispatcher.wait_for_result(
+                    action_id=envelope.action_id,
+                    request_id=request_id,
+                )
+                action_payload = _action_result_payload(envelope, action_result, action)
+                action_results.append(action_payload)
+                yield _sse_event("action_result", action_payload)
+                execution_context.append(
+                    _format_action_context(
+                        action=action,
+                        status=action_result.status,
+                        output=action_result.output,
+                        error=action_result.error,
+                    )
+                )
+                follow_up = _follow_up_action_from_result(
+                    action,
+                    status=action_result.status,
+                    output=action_result.output,
+                )
+                if follow_up is not None:
+                    pending_actions.append(follow_up)
+
+            for step_result in result.steps:
+                execution_context.append(
+                    f"- {step_result.title}: {step_result.content[:500]}"
+                )
+
+        content = "\n\n".join(
+            f"### {s.title}\n{s.content}" for s in step_results
+        )
+        completed_count = len([s for s in step_results if s.status == "completed"])
+        summary = f"{completed_count}/{len(step_results)} 단계 완료"
+
+        if all_actions:
             yield _sse_event(
                 "actions",
                 {
                     "request_id": request_id,
-                    "total": len(result.actions),
-                    "items": [a.model_dump() for a in result.actions],
+                    "total": len(all_actions),
+                    "items": [a.model_dump() for a in all_actions],
+                    "results": action_results,
                 },
             )
 
         yield _sse_event(
             "assistant_done",
             {
-                "content": result.content,
-                "summary": result.summary,
-                "has_actions": len(result.actions) > 0,
-                "action_count": len(result.actions),
+                "content": content,
+                "summary": summary,
+                "has_actions": len(all_actions) > 0,
+                "action_count": len(all_actions),
+                "action_results": action_results,
             },
         )
     except Exception as exc:
         logger.error("deepthink execute failed: %s", exc)
+        fallback_actions = _fallback_client_actions(
+            req.message,
+            request=request,
+            user_id=principal.user_id,
+        )
+        if fallback_actions:
+            yield from _stream_dispatched_actions(
+                actions=fallback_actions,
+                request_id=request_id,
+                user_id=principal.user_id,
+                action_dispatcher=request.app.state.action_dispatcher,
+                done_content="브라우저 제어 액션을 실행 요청했습니다.",
+                done_summary="fallback action dispatched",
+            )
+            return
+
         # fallback: deep 모드로 chat_stream 사용
         stream = request.app.state.core_client.chat_stream(
             message=req.message,
@@ -303,7 +678,11 @@ def _stream_orchestrated_conversation(
             user_email=getattr(principal, "email", ""),
             request_id=request_id,
         )
-        for chunk in stream:
+        for chunk in _stream_with_model_logging(
+            stream,
+            request_id=request_id,
+            message=req.message,
+        ):
             yield chunk
 
 
@@ -403,7 +782,7 @@ def respond(
 ) -> ConversationResponse:
     _ = authorization_header
     core_client = request.app.state.core_client
-    request_id = request.headers.get("x-request-id", "")
+    request_id = request.headers.get("x-request-id") or f"req_{uuid4().hex}"
 
     result = orchestrate_conversation_turn(
         req.message,
@@ -457,13 +836,18 @@ def respond(
                 exit_condition="all steps executed",
                 notes=[],
             )
-            exec_resp = core_client.deepthink_execute(
+            (
+                _step_results,
+                summary,
+                content,
+                actions,
+                _action_results,
+            ) = _execute_deepthink_steps(
+                core_client=core_client,
+                action_dispatcher=request.app.state.action_dispatcher,
                 request_id=request_id,
                 message=req.message,
-                plan_steps=[
-                    {"id": s.id, "title": s.title, "description": s.description}
-                    for s in plan_resp.steps
-                ],
+                plan_steps=plan_resp.steps,
                 user_id=principal.user_id,
             )
             return ConversationResponse(
@@ -472,11 +856,11 @@ def respond(
                 confidence=result.decision.confidence,
                 reasons=result.decision.reasons,
                 handler="jarvis-core",
-                content=exec_resp.content,
-                summary=exec_resp.summary,
+                content=content,
+                summary=summary,
                 next_actions=[],
                 planning=planning,
-                actions=list(exec_resp.actions),
+                actions=actions,
             )
         except Exception as exc:
             logger.error("respond deepthink failed, using orchestrator result: %s", exc)
@@ -554,11 +938,11 @@ def _stream_chat_with_routing(
     principal,
 ) -> Generator[bytes, None, None]:
     """chat/stream에서도 auto일 때 conversation routing을 적용한다."""
-    request_id = request.headers.get("x-request-id", "")
+    request_id = request.headers.get("x-request-id") or f"req_{uuid4().hex}"
 
     if req.thinking_mode != "auto":
         # 명시적 모드 지정 → core에 바로 위임
-        yield from request.app.state.core_client.chat_stream(
+        stream = request.app.state.core_client.chat_stream(
             message=req.message,
             task_type=req.task_type,
             confirm=req.confirm,
@@ -567,6 +951,11 @@ def _stream_chat_with_routing(
             user_email=getattr(principal, "email", ""),
             request_id=request_id,
         )
+        yield from _stream_with_model_logging(
+            stream,
+            request_id=request_id,
+            message=req.message,
+        )
         return
 
     # auto 모드: conversation routing으로 분류
@@ -574,7 +963,7 @@ def _stream_chat_with_routing(
     _log_classification(req.message, decision.mode, decision.confidence)
 
     if decision.mode == ConversationMode.REALTIME:
-        yield from request.app.state.core_client.chat_stream(
+        stream = request.app.state.core_client.chat_stream(
             message=req.message,
             task_type=req.task_type,
             confirm=req.confirm,
@@ -582,6 +971,11 @@ def _stream_chat_with_routing(
             user_id=principal.user_id,
             user_email=getattr(principal, "email", ""),
             request_id=request_id,
+        )
+        yield from _stream_with_model_logging(
+            stream,
+            request_id=request_id,
+            message=req.message,
         )
         return
 
@@ -778,6 +1172,49 @@ def list_memory(
 
 
 # ── execute / verify ────────────────────────────────────────
+
+
+@api_router.get(
+    "/client/actions/pending",
+    tags=["execution"],
+    summary="Fetch pending client actions",
+)
+def pending_client_actions(
+    request: Request,
+    limit: int = 20,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+):
+    _ = authorization_header
+    principal = request.state.principal
+    return request.app.state.action_dispatcher.pending(
+        user_id=principal.user_id,
+        limit=max(1, min(limit, 100)),
+    )
+
+
+@api_router.post(
+    "/client/actions/{action_id}/result",
+    tags=["execution"],
+    summary="Submit client action result",
+)
+def submit_client_action_result(
+    action_id: str,
+    body: ClientActionResultRequest,
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+):
+    _ = authorization_header
+    principal = request.state.principal
+    result = request.app.state.action_dispatcher.complete(
+        user_id=principal.user_id,
+        action_id=action_id,
+        body=body,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="client action not found")
+    return result
 
 
 @api_router.post("/execute", tags=["execution"], summary="Execute action")

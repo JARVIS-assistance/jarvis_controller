@@ -83,19 +83,66 @@ SEARCH_KEYWORDS = {
     # 검색 직접 요청
     "검색", "찾아", "찾아줘", "찾아봐", "검색해", "검색해줘", "서치",
     "search", "look up", "find",
-    # 정보/지식 요청
-    "알려줘", "알려줄래", "알려주세요", "알아봐", "알아봐줘",
-    "뭐야", "뭔가요", "어때", "어떤가요",
-    "what is", "what's", "how to", "how much", "how many",
-    "who is", "when is", "where is", "tell me",
     # 날씨/뉴스/시세 등 실시간 정보
     "날씨", "기온", "온도", "미세먼지",
     "weather", "temperature", "forecast",
     "뉴스", "소식", "속보", "news",
     "주가", "환율", "시세", "코인", "비트코인",
     "stock", "price", "exchange rate",
-    # 번역/사전
-    "번역", "뜻", "의미", "translate", "meaning",
+}
+
+LIVE_INFO_KEYWORDS = {
+    "오늘",
+    "현재",
+    "최신",
+    "지금",
+    "실시간",
+    "날씨",
+    "기온",
+    "온도",
+    "미세먼지",
+    "뉴스",
+    "속보",
+    "주가",
+    "환율",
+    "시세",
+    "코인",
+    "비트코인",
+    "today",
+    "current",
+    "latest",
+    "now",
+    "weather",
+    "news",
+    "stock",
+    "price",
+    "exchange rate",
+}
+
+REALTIME_HINTS = {
+    "hi",
+    "hello",
+    "hey",
+    "안녕",
+    "고마워",
+    "감사",
+    "한국어로",
+    "대답해줘",
+    "말해줘",
+    "설명해줘",
+    "뭐야",
+    "뭔가요",
+    "어때",
+    "어떤가요",
+    "뜻",
+    "의미",
+    "번역",
+    "what is",
+    "what's",
+    "how to",
+    "tell me",
+    "meaning",
+    "translate",
 }
 
 PLANNING_KEYWORDS = {
@@ -145,6 +192,14 @@ def evaluate_conversation_mode(
             reasons=["explicit planning request"],
         )
 
+    if _looks_like_fast_realtime(normalized, message):
+        return RoutingDecision(
+            mode=ConversationMode.REALTIME,
+            triggered=False,
+            confidence=0.85,
+            reasons=["fast realtime conversational request"],
+        )
+
     deep_score = 0
     planning_score = 0
     reasons: list[str] = []
@@ -169,8 +224,13 @@ def evaluate_conversation_mode(
 
     search_hits = _count_keyword_hits(normalized, SEARCH_KEYWORDS)
     if search_hits:
-        deep_score += min(search_hits, 3)
+        deep_score += min(search_hits, 2)
         reasons.append("search/information-oriented language")
+
+    live_info_hits = _count_keyword_hits(normalized, LIVE_INFO_KEYWORDS)
+    if live_info_hits and search_hits:
+        deep_score += min(live_info_hits, 2)
+        reasons.append("live information requested")
 
     planning_hits = _count_keyword_hits(normalized, PLANNING_KEYWORDS)
     if planning_hits:
@@ -189,8 +249,8 @@ def evaluate_conversation_mode(
         planning_score += 1
         reasons.append("conversation ambiguity accumulated")
 
-    # 실행/제어/검색 키워드가 있으면 임계값 낮춤 (짧은 명령도 deep으로)
-    deep_threshold = 1 if (execution_hits or search_hits) else 4
+    # 실행/제어는 즉시 액션/deep 대상으로 둔다. 일반 검색/질문은 realtime을 우선한다.
+    deep_threshold = 1 if execution_hits else 3
 
     if deep_score >= deep_threshold and deep_score >= planning_score:
         return RoutingDecision(
@@ -240,6 +300,23 @@ def _has_multistep_structure(message: str) -> bool:
     conjunctions = ("그리고", "다음", "then", "after that", "finally")
     lowered = message.lower()
     return numbered_lines >= 2 or sum(token in lowered for token in conjunctions) >= 2
+
+
+def _looks_like_fast_realtime(normalized: str, original: str) -> bool:
+    if len(original) > 220:
+        return False
+    if "```" in original or _looks_like_log_or_traceback(original):
+        return False
+    if _count_keyword_hits(normalized, EXECUTION_KEYWORDS):
+        return False
+    if _count_keyword_hits(normalized, PLANNING_KEYWORDS):
+        return False
+    if _count_keyword_hits(normalized, LIVE_INFO_KEYWORDS) and _count_keyword_hits(
+        normalized,
+        SEARCH_KEYWORDS,
+    ):
+        return False
+    return _contains_phrase(normalized, REALTIME_HINTS)
 
 
 def _confidence_from_score(score: int) -> float:

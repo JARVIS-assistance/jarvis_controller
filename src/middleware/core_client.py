@@ -32,6 +32,9 @@ class CoreClient:
             base_url or os.getenv("JARVIS_CORE_URL", "http://localhost:3010")
         ).rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.deepthink_timeout_seconds = float(
+            os.getenv("JARVIS_DEEPTHINK_TIMEOUT_SECONDS", "120")
+        )
 
     # ── conversation (기존) ─────────────────────────────────
 
@@ -257,6 +260,7 @@ class CoreClient:
             JarvisCoreEndpoints.INTERNAL_DEEPTHINK_PLAN.path,
             body={"request_id": request_id, "message": message},
             extra_headers={"x-user-id": user_id, "x-request-id": request_id},
+            timeout_seconds=self.deepthink_timeout_seconds,
         )
         return DeepThinkPlanResponse.model_validate(raw)
 
@@ -267,6 +271,7 @@ class CoreClient:
         message: str,
         plan_steps: list[dict[str, str]],
         user_id: str,
+        execution_context: list[str] | None = None,
     ) -> DeepThinkResponse:
         raw = self._request_json(
             JarvisCoreEndpoints.INTERNAL_DEEPTHINK_EXECUTE.method,
@@ -275,8 +280,10 @@ class CoreClient:
                 "request_id": request_id,
                 "message": message,
                 "plan_steps": plan_steps,
+                "execution_context": execution_context or [],
             },
             extra_headers={"x-user-id": user_id, "x-request-id": request_id},
+            timeout_seconds=self.deepthink_timeout_seconds,
         )
         return DeepThinkResponse.model_validate(raw)
 
@@ -289,6 +296,7 @@ class CoreClient:
         *,
         body: dict[str, object] | list | None,
         extra_headers: dict[str, str] | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, object] | list:
         raw_body: bytes | None = None
         headers = {"accept": "application/json"}
@@ -306,7 +314,7 @@ class CoreClient:
         )
         try:
             with urllib.request.urlopen(
-                request, timeout=self.timeout_seconds
+                request, timeout=timeout_seconds or self.timeout_seconds
             ) as response:
                 payload = response.read()
         except urllib.error.HTTPError as exc:
