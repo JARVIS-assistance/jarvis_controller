@@ -22,18 +22,26 @@ from jarvis_contracts import (
     PlanningPayload,
     PrincipalResponse,
     VerifyRequest,
+    action_registry_payload,
 )
 
-from jarvis_contracts import DeepThinkResponse
 from planner.conversation_orchestrator import orchestrate_conversation_turn
 from planner.executor import SUPPORTED_ACTIONS, run_execute, run_verify
 from planner.conversation_routing import (
     ConversationContext,
     ConversationMode,
+    RoutingDecision,
     evaluate_conversation_mode,
 )
-from planner.client_action_intents import infer_client_actions
-from planner.dom_link_resolver import resolve_link_from_dom_output
+from planner.action_intent_classifier import (
+    DIRECT_EXECUTION_MODES,
+    ActionIntentDecision,
+    classify_client_action_intent_decision,
+)
+from planner.dom_link_resolver import (
+    resolve_input_from_dom_output,
+    resolve_link_from_dom_output,
+)
 from planner.planning_engine import build_plan
 
 logger = logging.getLogger("jarvis_controller")
@@ -205,27 +213,106 @@ def _format_action_context(
     )
 
 
-def _fallback_client_actions(
-    message: str,
+def _client_action_context(
     *,
     request: Request | None = None,
     user_id: str | None = None,
-) -> list[ClientAction]:
+) -> dict[str, object] | None:
     context: dict[str, object] = {}
-    if request is not None and user_id:
-        store = getattr(request.app.state, "action_context", None)
-        browser_context = (
-            store.browser_context(user_id)
-            if store is not None and hasattr(store, "browser_context")
-            else None
-        )
-        if browser_context is not None:
-            context = {
+    if request is None or not user_id:
+        return None
+    platform = _header_value(request, "x-client-platform")
+    if platform:
+        context["platform"] = platform
+    shell = _header_value(request, "x-client-shell")
+    if shell:
+        context["shell"] = shell
+    default_browser = _header_value(request, "x-client-browser")
+    if default_browser:
+        context["default_browser"] = default_browser
+    calendar_provider = _header_value(request, "x-client-calendar-provider")
+    if calendar_provider:
+        context["calendar_provider"] = calendar_provider
+    timezone = _header_value(request, "x-client-timezone")
+    if timezone:
+        context["timezone"] = timezone
+    capabilities = _header_csv(request, "x-client-capabilities")
+    if capabilities:
+        context["capabilities"] = capabilities
+    store = getattr(request.app.state, "action_context", None)
+    browser_context = (
+        store.browser_context(user_id)
+        if store is not None and hasattr(store, "browser_context")
+        else None
+    )
+    if browser_context is not None:
+        context.update(
+            {
                 "browser_active": True,
                 "last_query": browser_context.last_query,
                 "last_url": browser_context.last_url,
             }
-    return infer_client_actions(message, context=context or None)
+        )
+    return context or None
+
+
+def _header_value(request: Request, name: str) -> str | None:
+    raw = request.headers.get(name)
+    if raw is None:
+        return None
+    value = raw.strip()
+    return value or None
+
+
+def _header_csv(request: Request, name: str) -> list[str]:
+    raw = request.headers.get(name)
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def _client_action_decision(
+    message: str,
+    *,
+    request: Request | None = None,
+    user_id: str | None = None,
+) -> ActionIntentDecision | None:
+    return classify_client_action_intent_decision(
+        message,
+        context=_client_action_context(request=request, user_id=user_id),
+    )
+
+
+def _action_intent_payload(
+    decision: ActionIntentDecision | None,
+    *,
+    unavailable: bool = False,
+) -> dict[str, object]:
+    if decision is None:
+        return {
+            "should_act": False,
+            "execution_mode": "unavailable",
+            "intent": None,
+            "confidence": 0.0,
+            "reason": "sLLM action classifier unavailable" if unavailable else None,
+            "action_count": 0,
+        }
+    return {
+        "should_act": decision.should_act,
+        "execution_mode": decision.execution_mode,
+        "intent": decision.intent,
+        "confidence": decision.confidence,
+        "reason": decision.reason,
+        "action_count": len(decision.actions),
+    }
+
+
+def _is_direct_action_decision(decision: ActionIntentDecision | None) -> bool:
+    return (
+        decision is not None
+        and decision.execution_mode in DIRECT_EXECUTION_MODES
+        and bool(decision.actions)
+    )
 
 
 def _action_result_payload(envelope, action_result, action: ClientAction) -> dict[str, object]:
@@ -293,6 +380,53 @@ def _stream_dispatched_actions(
             "results": action_results,
         },
     )
+    yield _sse_event(
+        "assistant_done",
+        {
+            "content": done_content,
+            "summary": done_summary,
+            "has_actions": True,
+            "action_count": len(action_results),
+            "action_results": action_results,
+        },
+    )
+
+
+def _dispatch_actions_sync(
+    *,
+    actions: list[ClientAction],
+    request_id: str,
+    user_id: str,
+    action_dispatcher,
+) -> tuple[list[ClientAction], list[dict[str, object]]]:
+    all_actions: list[ClientAction] = []
+    action_results: list[dict[str, object]] = []
+    pending_actions = list(actions)
+    while pending_actions:
+        action = pending_actions.pop(0)
+        all_actions.append(action)
+        envelope, action_result = action_dispatcher.dispatch_and_wait(
+            user_id=user_id,
+            request_id=request_id,
+            action=action,
+        )
+        action_payload = _action_result_payload(envelope, action_result, action)
+        action_results.append(action_payload)
+        _record_action_context(
+            action_dispatcher=action_dispatcher,
+            user_id=user_id,
+            action=action,
+            status=action_result.status,
+            output=action_result.output,
+        )
+        follow_up = _follow_up_action_from_result(
+            action,
+            status=action_result.status,
+            output=action_result.output,
+        )
+        if follow_up is not None:
+            pending_actions.append(follow_up)
+    return all_actions, action_results
 
 
 def _record_action_context(
@@ -312,16 +446,6 @@ def _record_action_context(
         status=status,
         output=output,
     )
-    yield _sse_event(
-        "assistant_done",
-        {
-            "content": done_content,
-            "summary": done_summary,
-            "has_actions": True,
-            "action_count": len(action_results),
-            "action_results": action_results,
-        },
-    )
 
 
 def _follow_up_action_from_result(
@@ -336,22 +460,59 @@ def _follow_up_action_from_result(
         return None
     if not isinstance(action.args, dict):
         return None
-    if action.args.get("purpose") != "resolve_open_request":
-        return None
+    purpose = action.args.get("purpose")
     raw_query = action.args.get("query")
     if not isinstance(raw_query, str) or not raw_query.strip():
         return None
-    resolved = resolve_link_from_dom_output(output, query=raw_query)
-    if resolved is None:
-        return None
-    return ClientAction(
-        type="open_url",
-        command=None,
-        target=resolved.href,
-        args={"browser": "chrome"},
-        description=f"현재 페이지에서 '{raw_query}'에 가장 가까운 링크 열기: {resolved.title or resolved.href}",
-        requires_confirm=False,
-    )
+    if purpose == "resolve_open_request":
+        resolved = resolve_link_from_dom_output(output, query=raw_query)
+        if resolved is None:
+            return None
+        if resolved.ai_id is not None:
+            return ClientAction(
+                type="browser_control",
+                command="click_element",
+                target="active_tab",
+                args={"ai_id": resolved.ai_id},
+                description=(
+                    f"현재 페이지에서 '{raw_query}'에 가장 가까운 요소 클릭: "
+                    f"{resolved.title or resolved.href}"
+                ),
+                requires_confirm=False,
+            )
+        return ClientAction(
+            type="open_url",
+            command=None,
+            target=resolved.href,
+            args={"browser": "chrome"},
+            description=(
+                f"현재 페이지에서 '{raw_query}'에 가장 가까운 링크 열기: "
+                f"{resolved.title or resolved.href}"
+            ),
+            requires_confirm=False,
+        )
+    if purpose == "resolve_type_request":
+        raw_text = action.args.get("text")
+        if not isinstance(raw_text, str) or not raw_text:
+            return None
+        resolved_input = resolve_input_from_dom_output(output, query=raw_query)
+        if resolved_input is None:
+            return None
+        return ClientAction(
+            type="browser_control",
+            command="type_element",
+            target="active_tab",
+            payload=raw_text,
+            args={
+                "ai_id": resolved_input.ai_id,
+                "enter": bool(action.args.get("enter", False)),
+            },
+            description=(
+                f"현재 페이지의 '{resolved_input.label or raw_query}' 입력란에 텍스트 입력"
+            ),
+            requires_confirm=False,
+        )
+    return None
 
 
 def _execute_deepthink_steps(
@@ -423,19 +584,83 @@ def _stream_orchestrated_conversation(
     request: Request,
     principal,
 ) -> Generator[bytes, None, None]:
-    decision = evaluate_conversation_mode(
-        req.message,
-        override=req.override.value if req.override else None,
-        context=ConversationContext(
-            recent_failures=req.recent_failures,
-            ambiguity_count=req.ambiguity_count,
-            turn_index=req.turn_index,
-        ),
-    )
+    request_id = request.headers.get("x-request-id") or f"req_{uuid4().hex}"
+
+    action_decision: ActionIntentDecision | None = None
+    if req.override != ContractConversationMode.PLANNING:
+        action_decision = _client_action_decision(
+            req.message,
+            request=request,
+            user_id=principal.user_id,
+        )
+        yield _sse_event(
+            "action_intent",
+            _action_intent_payload(
+                action_decision,
+                unavailable=action_decision is None,
+            ),
+        )
+        if _is_direct_action_decision(action_decision):
+            logger.info(
+                "action direct dispatch request_id=%s mode=%s actions=%d message=%s",
+                request_id,
+                action_decision.execution_mode,
+                len(action_decision.actions),
+                req.message[:200],
+            )
+            yield _sse_event(
+                "classification",
+                {
+                    "category": "general",
+                    "mode": ConversationMode.REALTIME.value,
+                    "confidence": action_decision.confidence,
+                    "reasons": ["direct client action"],
+                },
+            )
+            yield _sse_event(
+                "thinking",
+                {
+                    "text": "클라이언트 액션을 준비중...",
+                    "mode": ConversationMode.REALTIME.value,
+                },
+            )
+            yield from _stream_dispatched_actions(
+                actions=action_decision.actions,
+                request_id=request_id,
+                user_id=principal.user_id,
+                action_dispatcher=request.app.state.action_dispatcher,
+                done_content="요청한 작업을 실행했습니다.",
+                done_summary="direct client action dispatched",
+            )
+            return
+
+    if (
+        action_decision is not None
+        and action_decision.execution_mode == "needs_plan"
+        and req.override is None
+    ):
+        decision = RoutingDecision(
+            mode=ConversationMode.DEEP,
+            triggered=True,
+            confidence=action_decision.confidence,
+            reasons=[
+                "action intent requires planning: "
+                f"{action_decision.reason or action_decision.intent or 'needs_plan'}"
+            ],
+        )
+    else:
+        decision = evaluate_conversation_mode(
+            req.message,
+            override=req.override.value if req.override else None,
+            context=ConversationContext(
+                recent_failures=req.recent_failures,
+                ambiguity_count=req.ambiguity_count,
+                turn_index=req.turn_index,
+            ),
+        )
     _log_classification(req.message, decision.mode, decision.confidence)
 
     category = "general" if decision.mode == ConversationMode.REALTIME else "deep"
-    request_id = request.headers.get("x-request-id") or f"req_{uuid4().hex}"
 
     yield _sse_event(
         "classification",
@@ -446,26 +671,6 @@ def _stream_orchestrated_conversation(
             "reasons": decision.reasons,
         },
     )
-
-    direct_actions = _fallback_client_actions(
-        req.message,
-        request=request,
-        user_id=principal.user_id,
-    )
-    if direct_actions and decision.mode != ConversationMode.PLANNING:
-        yield _sse_event(
-            "thinking",
-            {"text": "브라우저 제어 액션을 준비중...", "mode": decision.mode.value},
-        )
-        yield from _stream_dispatched_actions(
-            actions=direct_actions,
-            request_id=request_id,
-            user_id=principal.user_id,
-            action_dispatcher=request.app.state.action_dispatcher,
-            done_content="브라우저 제어 액션을 실행 요청했습니다.",
-            done_summary="direct client action dispatched",
-        )
-        return
 
     # ── realtime: 바로 core에 위임 ─────────────────────────
     if decision.mode == ConversationMode.REALTIME:
@@ -652,22 +857,6 @@ def _stream_orchestrated_conversation(
         )
     except Exception as exc:
         logger.error("deepthink execute failed: %s", exc)
-        fallback_actions = _fallback_client_actions(
-            req.message,
-            request=request,
-            user_id=principal.user_id,
-        )
-        if fallback_actions:
-            yield from _stream_dispatched_actions(
-                actions=fallback_actions,
-                request_id=request_id,
-                user_id=principal.user_id,
-                action_dispatcher=request.app.state.action_dispatcher,
-                done_content="브라우저 제어 액션을 실행 요청했습니다.",
-                done_summary="fallback action dispatched",
-            )
-            return
-
         # fallback: deep 모드로 chat_stream 사용
         stream = request.app.state.core_client.chat_stream(
             message=req.message,
@@ -781,8 +970,44 @@ def respond(
     authorization_header: AuthHeaderDoc = None,
 ) -> ConversationResponse:
     _ = authorization_header
+    principal = request.state.principal
     core_client = request.app.state.core_client
     request_id = request.headers.get("x-request-id") or f"req_{uuid4().hex}"
+
+    if req.override != ContractConversationMode.PLANNING:
+        action_decision = _client_action_decision(
+            req.message,
+            request=request,
+            user_id=principal.user_id,
+        )
+        if _is_direct_action_decision(action_decision):
+            logger.info(
+                "action direct dispatch request_id=%s mode=%s actions=%d message=%s",
+                request_id,
+                action_decision.execution_mode,
+                len(action_decision.actions),
+                req.message[:200],
+            )
+            actions, _action_results = _dispatch_actions_sync(
+                actions=action_decision.actions,
+                request_id=request_id,
+                user_id=principal.user_id,
+                action_dispatcher=request.app.state.action_dispatcher,
+            )
+            return ConversationResponse(
+                mode=ContractConversationMode.REALTIME,
+                triggered=True,
+                confidence=action_decision.confidence,
+                reasons=[
+                    "direct client action: "
+                    f"{action_decision.reason or action_decision.intent or action_decision.execution_mode}"
+                ],
+                handler="client-action",
+                content="요청한 작업을 실행했습니다.",
+                summary="direct client action dispatched",
+                next_actions=[],
+                actions=actions,
+            )
 
     result = orchestrate_conversation_turn(
         req.message,
@@ -818,7 +1043,6 @@ def respond(
     # deep 모드: AI 플래닝 → 실행 → actions 수집
     if result.decision.mode == ConversationMode.DEEP:
         try:
-            principal = request.state.principal
             plan_resp = core_client.deepthink_plan(
                 request_id=request_id,
                 message=req.message,
@@ -958,8 +1182,65 @@ def _stream_chat_with_routing(
         )
         return
 
-    # auto 모드: conversation routing으로 분류
-    decision = evaluate_conversation_mode(req.message)
+    action_decision = _client_action_decision(
+        req.message,
+        request=request,
+        user_id=principal.user_id,
+    )
+    yield _sse_event(
+        "action_intent",
+        _action_intent_payload(
+            action_decision,
+            unavailable=action_decision is None,
+        ),
+    )
+    if _is_direct_action_decision(action_decision):
+        logger.info(
+            "action direct dispatch request_id=%s mode=%s actions=%d message=%s",
+            request_id,
+            action_decision.execution_mode,
+            len(action_decision.actions),
+            req.message[:200],
+        )
+        yield _sse_event(
+            "classification",
+            {
+                "category": "general",
+                "mode": ConversationMode.REALTIME.value,
+                "confidence": action_decision.confidence,
+                "reasons": ["direct client action"],
+            },
+        )
+        yield _sse_event(
+            "thinking",
+            {
+                "text": "클라이언트 액션을 준비중...",
+                "mode": ConversationMode.REALTIME.value,
+            },
+        )
+        yield from _stream_dispatched_actions(
+            actions=action_decision.actions,
+            request_id=request_id,
+            user_id=principal.user_id,
+            action_dispatcher=request.app.state.action_dispatcher,
+            done_content="요청한 작업을 실행했습니다.",
+            done_summary="direct client action dispatched",
+        )
+        return
+
+    # auto 모드: action이 아닐 때만 conversation routing으로 분류
+    if action_decision is not None and action_decision.execution_mode == "needs_plan":
+        decision = RoutingDecision(
+            mode=ConversationMode.DEEP,
+            triggered=True,
+            confidence=action_decision.confidence,
+            reasons=[
+                "action intent requires planning: "
+                f"{action_decision.reason or action_decision.intent or 'needs_plan'}"
+            ],
+        )
+    else:
+        decision = evaluate_conversation_mode(req.message)
     _log_classification(req.message, decision.mode, decision.confidence)
 
     if decision.mode == ConversationMode.REALTIME:
@@ -1172,6 +1453,19 @@ def list_memory(
 
 
 # ── execute / verify ────────────────────────────────────────
+
+
+@api_router.get(
+    "/client/actions/registry",
+    tags=["execution"],
+    summary="Fetch canonical client action type registry",
+)
+def client_action_registry(
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+):
+    _ = authorization_header
+    return action_registry_payload()
 
 
 @api_router.get(

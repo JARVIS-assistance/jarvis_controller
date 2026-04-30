@@ -62,23 +62,6 @@ ANALYSIS_KEYWORDS = {
     "compare",
 }
 
-EXECUTION_KEYWORDS = {
-    # 앱/프로그램 제어
-    "실행", "열어", "켜줘", "띄워", "종료", "닫아",
-    "launch", "open", "run", "start", "close", "quit",
-    # 파일 작업
-    "파일 만들어", "파일 생성", "파일 저장", "파일 읽어",
-    "create file", "write file", "save file",
-    # 터미널/명령
-    "터미널", "명령어", "설치", "빌드", "배포",
-    "terminal", "command", "install", "build", "deploy",
-    # 물리 제어
-    "클릭", "드래그", "스크롤", "타이핑", "입력",
-    "스크린샷", "화면 캡처", "화면 보여",
-    "click", "drag", "scroll", "type", "screenshot",
-    "hotkey", "단축키",
-}
-
 SEARCH_KEYWORDS = {
     # 검색 직접 요청
     "검색", "찾아", "찾아줘", "찾아봐", "검색해", "검색해줘", "서치",
@@ -217,10 +200,9 @@ def evaluate_conversation_mode(
         deep_score += min(analysis_hits, 3)
         reasons.append("analysis-oriented language")
 
-    execution_hits = _count_keyword_hits(normalized, EXECUTION_KEYWORDS)
-    if execution_hits:
-        deep_score += min(execution_hits, 3)
-        reasons.append("execution/control-oriented language")
+    # Client execution/control intent is handled by the sLLM action classifier
+    # before conversation routing. Do not route simple app/browser commands to
+    # deepthink just because they contain execution language.
 
     search_hits = _count_keyword_hits(normalized, SEARCH_KEYWORDS)
     if search_hits:
@@ -249,8 +231,7 @@ def evaluate_conversation_mode(
         planning_score += 1
         reasons.append("conversation ambiguity accumulated")
 
-    # 실행/제어는 즉시 액션/deep 대상으로 둔다. 일반 검색/질문은 realtime을 우선한다.
-    deep_threshold = 1 if execution_hits else 3
+    deep_threshold = 2 if analysis_hits else 3
 
     if deep_score >= deep_threshold and deep_score >= planning_score:
         return RoutingDecision(
@@ -306,8 +287,6 @@ def _looks_like_fast_realtime(normalized: str, original: str) -> bool:
     if len(original) > 220:
         return False
     if "```" in original or _looks_like_log_or_traceback(original):
-        return False
-    if _count_keyword_hits(normalized, EXECUTION_KEYWORDS):
         return False
     if _count_keyword_hits(normalized, PLANNING_KEYWORDS):
         return False

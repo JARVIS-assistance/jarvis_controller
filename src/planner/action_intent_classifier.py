@@ -4,41 +4,48 @@ import json
 import logging
 import os
 import re
+import socket
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
-from jarvis_contracts import ClientAction
+from jarvis_contracts import (
+    ACTION_INTENT_ACTION_TYPES,
+    COMMANDS_BY_ACTION_TYPE,
+    ClientAction,
+    format_action_registry_for_prompt,
+    normalize_action_payload,
+)
 
 logger = logging.getLogger("jarvis_controller.action_intent_classifier")
 
-ALLOWED_ACTION_TYPES = {
-    "app_control",
-    "open_url",
-    "browser_control",
-    "keyboard_type",
-    "hotkey",
-    "clipboard",
-    "notify",
-}
+ALLOWED_ACTION_TYPES = set(ACTION_INTENT_ACTION_TYPES)
+ALLOWED_BROWSER_COMMANDS = set(COMMANDS_BY_ACTION_TYPE["browser_control"])
+ALLOWED_CALENDAR_COMMANDS = set(COMMANDS_BY_ACTION_TYPE["calendar_control"])
+ALLOWED_TERMINAL_COMMANDS = set(COMMANDS_BY_ACTION_TYPE["terminal"])
 
-ALLOWED_BROWSER_COMMANDS = {
-    "extract_dom",
-    "select_result",
-    "scroll",
-    "back",
-    "forward",
-    "reload",
-}
+DIRECT_EXECUTION_MODES = {"direct", "direct_sequence"}
+ALLOWED_EXECUTION_MODES = {*DIRECT_EXECUTION_MODES, "needs_plan", "no_action"}
 
 
-def classify_client_action_intent(
+@dataclass(frozen=True)
+class ActionIntentDecision:
+    should_act: bool
+    execution_mode: str
+    intent: str | None
+    confidence: float
+    reason: str | None
+    actions: list[ClientAction]
+
+
+def classify_client_action_intent_decision(
     message: str,
     *,
     context: dict[str, Any] | None = None,
-) -> list[ClientAction]:
-    if not _enabled() or not _should_try_classifier(message, context):
-        return []
+) -> ActionIntentDecision | None:
+    if not _enabled():
+        return None
 
     endpoint = os.getenv(
         "JARVIS_ACTION_INTENT_MODEL_ENDPOINT",
@@ -50,6 +57,7 @@ def classify_client_action_intent(
     )
     timeout = _float_env("JARVIS_ACTION_INTENT_MODEL_TIMEOUT_SECONDS", 4.0)
     threshold = _float_env("JARVIS_ACTION_INTENT_CONFIDENCE_THRESHOLD", 0.72)
+    max_tokens = int(_float_env("JARVIS_ACTION_INTENT_MODEL_MAX_TOKENS", 180))
 
     payload = {
         "model": model,
@@ -68,6 +76,7 @@ def classify_client_action_intent(
         ],
         "stream": False,
         "temperature": 0,
+        "max_tokens": max_tokens,
     }
 
     try:
@@ -80,8 +89,24 @@ def classify_client_action_intent(
         parsed = _parse_json_object(content)
         confidence = float(parsed.get("confidence") or 0)
         if not parsed.get("should_act") or confidence < threshold:
-            return []
+            intent = _string_or_none(parsed.get("intent"))
+            logger.info(
+                "action intent classifier selected mode=%s actions=0 intent=%s confidence=%.2f message=%s",
+                "no_action",
+                intent,
+                confidence,
+                message[:160],
+            )
+            return ActionIntentDecision(
+                should_act=False,
+                execution_mode="no_action",
+                intent=intent,
+                confidence=confidence,
+                reason=_string_or_none(parsed.get("reason")),
+                actions=[],
+            )
         action_payloads = parsed.get("actions")
+        actions: list[ClientAction] = []
         if isinstance(action_payloads, list):
             actions = [
                 action
@@ -90,15 +115,40 @@ def classify_client_action_intent(
                 for action in [_coerce_client_action(item)]
                 if action is not None
             ]
-            return actions
-        action_payload = parsed.get("action")
-        if isinstance(action_payload, dict):
+        elif isinstance(parsed.get("action"), dict):
+            action_payload = parsed["action"]
             action = _coerce_client_action(action_payload)
-            return [action] if action is not None else []
-        return []
+            actions = [action] if action is not None else []
+        intent = _string_or_none(parsed.get("intent"))
+        execution_mode = _execution_mode(parsed.get("execution_mode"), actions)
+        logger.info(
+            "action intent classifier selected mode=%s actions=%d intent=%s confidence=%.2f message=%s",
+            execution_mode,
+            len(actions),
+            intent,
+            confidence,
+            message[:160],
+        )
+        return ActionIntentDecision(
+            should_act=bool(parsed.get("should_act")),
+            execution_mode=execution_mode,
+            intent=intent,
+            confidence=confidence,
+            reason=_string_or_none(parsed.get("reason")),
+            actions=actions,
+        )
+    except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+        logger.warning(
+            "action intent classifier failed endpoint=%s model=%s timeout=%.1fs error=%s",
+            endpoint,
+            model,
+            timeout,
+            exc,
+        )
+        return None
     except Exception as exc:
         logger.warning("action intent classifier failed: %s", exc)
-        return []
+        return None
 
 
 def _enabled() -> bool:
@@ -106,95 +156,56 @@ def _enabled() -> bool:
     return raw not in {"0", "false", "no", "off"}
 
 
-def _should_try_classifier(message: str, context: dict[str, Any] | None) -> bool:
-    text = message.lower()
-    if context and context.get("browser_active"):
-        return _has_any(
-            text,
-            "열어",
-            "켜",
-            "켜서",
-            "앱",
-            "작성",
-            "입력",
-            "써",
-            "타이핑",
-            "들어가",
-            "클릭",
-            "선택",
-            "open",
-            "click",
-            "select",
-        )
-    return _has_any(
-        text,
-        "브라우저",
-        "크롬",
-        "앱",
-        "어플",
-        "페이지",
-        "검색 결과",
-        "열어",
-        "켜",
-        "켜서",
-        "작성",
-        "입력",
-        "써",
-        "타이핑",
-        "들어가",
-        "클릭",
-        "선택",
-        "스크롤",
-        "뒤로",
-        "앞으로",
-        "새로고침",
-        "browser",
-        "chrome",
-        "page",
-        "open",
-        "click",
-        "select",
-        "scroll",
-        "back",
-        "forward",
-        "reload",
-    )
-
-
 def _system_prompt() -> str:
-    return """You are a strict action intent classifier for JARVIS.
+    allowed_types = "|".join(ACTION_INTENT_ACTION_TYPES)
+    registry = format_action_registry_for_prompt(direct_only=True)
+    template = """You classify whether JARVIS must execute a client action.
 Return only one JSON object. No markdown. No prose.
 
-Decide whether the user wants the client runtime to perform an action.
-Do not answer the user. Do not invent URLs.
+Infer meaning from the user message and context. Do not answer the user. Do not invent URLs.
 
-Context fields may include:
-- browser_active: true when a browser/search page was recently opened
-- last_query: previous browser search query
-- last_url: previous opened URL
+Context:
+- platform: "macos", "windows", "linux", or "unknown".
+- shell: preferred shell such as "zsh", "bash", "powershell", or "cmd".
+- default_browser: preferred browser such as "chrome", "safari", or "edge".
+- capabilities: supported client action types/commands.
+- calendar_provider: user-configured calendar provider/app, or "none".
+- timezone: user's local timezone.
+- browser_active means a browser/search page was recently opened; last_query/last_url describe it.
+
+Execution mode:
+- direct: one simple client action. Never plan.
+- direct_sequence: a short ordered sequence of client actions. Never plan.
+- needs_plan: complex work requiring investigation, planning, multiple reasoning steps, or content synthesis after actions.
+- no_action: ordinary chat or informational answer. No client action.
 
 Action policy:
-- If the user asks to open/click/select something on the current page or previous search results, emit:
-  type=browser_control, command=extract_dom, target=active_tab,
-  args={purpose:"resolve_open_request", query:"the item to open", include_links:true, max_links:120}
-- If the user asks to open a URL, emit type=open_url with target URL.
-- If the user asks to search in a browser, emit type=open_url with Google search URL and args.query.
-- If the user asks scroll/back/forward/reload, emit browser_control with that command.
-- If the user asks to open/launch an app, emit type=app_control, command=open, target=app name.
-- If the user asks to open an app and write/type text, emit two actions in order:
-  1. app_control open target=app name
-  2. keyboard_type payload=the exact text to type, args={enter:false}
+- Current page click/open/select: browser_control extract_dom target=active_tab args={purpose:"resolve_open_request",query:"item",include_links:true,max_links:120}
+- Current page typing: browser_control extract_dom target=active_tab args={purpose:"resolve_type_request",query:"field",text:"exact text",include_elements:true,max_links:120}
+- Open URL: open_url target=url.
+- Browser search: open_url target=https://www.google.com/search?q=... args={query:"search terms",browser:"chrome"}.
+- Scroll/back/forward/reload: browser_control command=scroll/back/forward/reload.
+- Open app: app_control command=open target=app name.
+- Open app and type: actions=[app_control open, keyboard_type payload=exact text args={enter:false}].
+- Calendar: use calendar_control. commands=open/list_events/create_event/update_event/delete_event. Use user's calendar_provider and timezone from context. create/update/delete require requires_confirm=true.
+- Terminal commands: use terminal command=execute. Use target/context shell ("powershell" on Windows, "zsh" or "bash" on macOS/Linux) and payload as the command string. Terminal actions require requires_confirm=true.
+- For simple browser/app control, use direct/direct_sequence even if the user used natural language.
+- Set requires_confirm=false for ordinary open/search/scroll/type actions; true only for destructive or sensitive actions.
 - If it is ordinary chat or an informational question, should_act=false.
+
+Canonical action registry:
+__ACTION_REGISTRY__
 
 JSON schema:
 {
   "should_act": boolean,
-  "intent": "none|browser_search|open_url|open_link_from_current_page|browser_control|app_control|app_open_and_type",
+  "execution_mode": "direct|direct_sequence|needs_plan|no_action",
+  "intent": "none|browser_search|open_url|open_link_from_current_page|browser_control|app_control|app_open_and_type|calendar_control|terminal",
   "confidence": number,
   "reason": "short reason",
   "actions": [
     {
-      "type": "open_url|browser_control|app_control|keyboard_type|hotkey|clipboard|notify",
+      "type": "__ALLOWED_TYPES__",
       "command": string|null,
       "target": string|null,
       "payload": string|null,
@@ -204,7 +215,7 @@ JSON schema:
     }
   ] | null,
   "action": {
-    "type": "open_url|browser_control|app_control|keyboard_type|hotkey|clipboard|notify",
+    "type": "__ALLOWED_TYPES__",
     "command": string|null,
     "target": string|null,
     "payload": string|null,
@@ -214,6 +225,9 @@ JSON schema:
   } | null
 }
 """
+    return template.replace("__ACTION_REGISTRY__", registry).replace(
+        "__ALLOWED_TYPES__", allowed_types
+    )
 
 
 def _post_json(url: str, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
@@ -221,12 +235,22 @@ def _post_json(url: str, payload: dict[str, Any], *, timeout: float) -> dict[str
     req = urllib.request.Request(
         url=url,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "JARVIS/1.0",
+        },
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
-        raw = response.read().decode("utf-8")
-        return json.loads(raw) if raw else {}
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        raise RuntimeError(
+            f"HTTP {exc.code} from action intent model: {error_body[:500]}"
+        ) from exc
 
 
 def _parse_json_object(content: str) -> dict[str, Any]:
@@ -245,18 +269,30 @@ def _parse_json_object(content: str) -> dict[str, Any]:
 
 
 def _coerce_client_action(payload: dict[str, Any]) -> ClientAction | None:
+    payload = normalize_action_payload(payload)
     action_type = payload.get("type")
     command = payload.get("command")
     if action_type not in ALLOWED_ACTION_TYPES:
         return None
+    if action_type == "app_control" and command not in COMMANDS_BY_ACTION_TYPE["app_control"]:
+        return None
     if action_type == "browser_control" and command not in ALLOWED_BROWSER_COMMANDS:
         return None
+    if action_type == "calendar_control" and command not in ALLOWED_CALENDAR_COMMANDS:
+        return None
+    if action_type == "terminal" and command not in ALLOWED_TERMINAL_COMMANDS:
+        return None
+    args = payload.get("args") if isinstance(payload.get("args"), dict) else {}
+    if action_type == "browser_control" and command in {"click_element", "type_element"}:
+        raw_ai_id = args.get("ai_id")
+        if not isinstance(raw_ai_id, int):
+            return None
     return ClientAction(
         type=action_type,
         command=command if isinstance(command, str) else None,
         target=payload.get("target") if isinstance(payload.get("target"), str) else None,
         payload=payload.get("payload") if isinstance(payload.get("payload"), str) else None,
-        args=payload.get("args") if isinstance(payload.get("args"), dict) else {},
+        args=args,
         description=(
             payload.get("description")
             if isinstance(payload.get("description"), str)
@@ -266,8 +302,20 @@ def _coerce_client_action(payload: dict[str, Any]) -> ClientAction | None:
     )
 
 
-def _has_any(text: str, *tokens: str) -> bool:
-    return any(token in text for token in tokens)
+def _execution_mode(raw: Any, actions: list[ClientAction]) -> str:
+    if isinstance(raw, str):
+        normalized = raw.strip().lower()
+        if normalized in ALLOWED_EXECUTION_MODES:
+            return normalized
+    if len(actions) > 1:
+        return "direct_sequence"
+    if actions:
+        return "direct"
+    return "no_action"
+
+
+def _string_or_none(raw: Any) -> str | None:
+    return raw if isinstance(raw, str) else None
 
 
 def _float_env(name: str, default: float) -> float:
