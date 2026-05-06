@@ -12,7 +12,6 @@ from jarvis_contracts import (
     ClientActionValidationIssue,
 )
 
-
 RISKY_V2_ACTIONS = {
     "terminal.run",
     "calendar.create",

@@ -1,5 +1,4 @@
 from jarvis_contracts import ClientAction, ClientActionPlan, ClientActionV2
-
 from jarvis_controller.planner.action_validator import ActionValidator
 
 

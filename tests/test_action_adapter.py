@@ -1,8 +1,6 @@
 from jarvis_contracts import ClientActionPlan, ClientActionV2
-
 from jarvis_controller.planner.action_adapter import V2ToV1ActionAdapter
-from jarvis_controller.planner.action_compiler import _parse_plan
-from jarvis_controller.planner.action_compiler import parse_embedded_actions_from_text
+from jarvis_controller.planner.action_compiler import _parse_plan, parse_embedded_actions_from_text
 
 
 def test_adapter_maps_browser_search_to_deterministic_search_url() -> None:

@@ -70,7 +70,10 @@ def action_completion_message(
             f"일부 작업만 실행했습니다. "
             f"{completed_count}/{len(action_results)}개 완료, "
             f"첫 오류: {first_error}",
-            f"client action partially completed ({completed_count}/{len(action_results)} completed)",
+            (
+                "client action partially completed "
+                f"({completed_count}/{len(action_results)} completed)"
+            ),
         )
 
     if all(status == "timeout" for status in non_completed):
