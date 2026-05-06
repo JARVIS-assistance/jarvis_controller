@@ -2,7 +2,6 @@ import concurrent.futures
 import json
 import logging
 import os
-import time
 from collections.abc import Generator
 from typing import Annotated, Any, Literal, Optional
 from uuid import uuid4
@@ -72,7 +71,7 @@ logger = logging.getLogger("jarvis_controller")
 api_router = APIRouter()
 bearer_scheme = HTTPBearer(auto_error=False)
 _ACTION_ARBITRATION_BUFFER_SECONDS = "JARVIS_ACTION_ARBITRATION_BUFFER_SECONDS"
-_ACTION_ARBITRATION_DEFAULT_SECONDS = 0.15
+_ACTION_ARBITRATION_DEFAULT_SECONDS = 0.0
 TokenAuth = Annotated[
     HTTPAuthorizationCredentials | None,
     Depends(bearer_scheme),
@@ -302,6 +301,56 @@ def _start_action_decision_future(
     )
 
 
+def _start_routing_decision_future(
+    message: str,
+    *,
+    override: str | None = None,
+    context: ConversationContext | None = None,
+) -> tuple[
+    concurrent.futures.ThreadPoolExecutor,
+    concurrent.futures.Future[RoutingDecision],
+]:
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="conversation-routing",
+    )
+    return executor, executor.submit(
+        evaluate_conversation_mode,
+        message,
+        override=override,
+        context=context,
+    )
+
+
+def _classification_chunks_for_decision(decision: RoutingDecision) -> list[bytes]:
+    category = "general" if decision.mode == ConversationMode.REALTIME else "deep"
+    return [
+        _sse_event(
+            "classification",
+            {
+                "category": category,
+                "mode": decision.mode.value,
+                "confidence": decision.confidence,
+                "reasons": decision.reasons,
+            },
+        )
+    ]
+
+
+def _ready_routing_chunks(
+    route_future: concurrent.futures.Future[RoutingDecision] | None,
+) -> list[bytes]:
+    if route_future is None or not route_future.done():
+        return []
+    try:
+        decision = route_future.result()
+    except Exception as exc:
+        logger.warning("conversation routing decision failed after stream start: %s", exc)
+        return []
+    _log_classification("", decision.mode, decision.confidence)
+    return _classification_chunks_for_decision(decision)
+
+
 def _stream_realtime_with_action_arbitration(
     stream: Generator[bytes, None, None],
     *,
@@ -312,41 +361,18 @@ def _stream_realtime_with_action_arbitration(
     action_dispatcher,
     context: dict[str, object] | None,
 ) -> Generator[bytes, None, None]:
-    """Race realtime streaming against action classification.
-
-    The first few realtime chunks are buffered only long enough to let fast direct-action
-    decisions win without leaking assistant text.  Ordinary chat then flushes promptly and
-    continues without waiting for the action intent model.
-    """
-    if action_future is None:
-        yield from _stream_with_embedded_action_intercept(
-            stream,
-            request_id=request_id,
-            message=message,
-            user_id=user_id,
-            action_dispatcher=action_dispatcher,
-            context=context,
-        )
-        return
-
-    buffer_deadline = time.monotonic() + _action_arbitration_buffer_seconds()
-    buffered: list[bytes] = []
-    flushed = False
+    """Stream core bytes immediately while action classification runs in parallel."""
     emitted_action_intent = False
 
-    def ready_decision_chunks(*, timeout: float = 0.0) -> tuple[list[bytes], bool]:
+    def ready_decision_chunks() -> tuple[list[bytes], bool]:
         nonlocal emitted_action_intent
-        if action_future is None or emitted_action_intent:
+        if action_future is None or emitted_action_intent or not action_future.done():
             return [], False
-        if not action_future.done():
-            if timeout <= 0:
-                return [], False
-            try:
-                decision = action_future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                return [], False
-        else:
+        try:
             decision = action_future.result()
+        except Exception as exc:
+            logger.warning("action intent decision failed after stream start: %s", exc)
+            decision = None
 
         emitted_action_intent = True
         chunks = [_sse_event(
@@ -363,7 +389,7 @@ def _stream_realtime_with_action_arbitration(
                     action_dispatcher=action_dispatcher,
                 )
             )
-            return chunks, True
+            return chunks, False
         return chunks, False
 
     try:
@@ -375,42 +401,58 @@ def _stream_realtime_with_action_arbitration(
             action_dispatcher=action_dispatcher,
             context=context,
         ):
-            decision_chunks, stopped = ready_decision_chunks()
-            for decision_chunk in decision_chunks:
-                yield decision_chunk
-            if stopped:
-                return
-
-            if not flushed and time.monotonic() < buffer_deadline:
-                buffered.append(chunk)
-                continue
-
-            if not flushed:
-                for buffered_chunk in buffered:
-                    yield buffered_chunk
-                buffered.clear()
-                flushed = True
             yield chunk
-
-        if not flushed:
-            wait_seconds = max(0.0, buffer_deadline - time.monotonic())
-            decision_chunks, stopped = ready_decision_chunks(timeout=wait_seconds)
-            for decision_chunk in decision_chunks:
-                yield decision_chunk
-            if stopped:
-                return
-            for buffered_chunk in buffered:
-                yield buffered_chunk
-        elif not emitted_action_intent:
             decision_chunks, stopped = ready_decision_chunks()
             for decision_chunk in decision_chunks:
                 yield decision_chunk
             if stopped:
                 return
+
+        decision_chunks, stopped = ready_decision_chunks()
+        for decision_chunk in decision_chunks:
+            yield decision_chunk
+        if stopped:
+            return
     except Exception:
         if action_future is not None:
             action_future.cancel()
         raise
+
+
+def _stream_realtime_with_parallel_decisions(
+    stream: Generator[bytes, None, None],
+    *,
+    action_future: concurrent.futures.Future[ActionIntentDecision | None] | None,
+    route_future: concurrent.futures.Future[RoutingDecision] | None,
+    request_id: str,
+    message: str,
+    user_id: str,
+    action_dispatcher,
+    context: dict[str, object] | None,
+) -> Generator[bytes, None, None]:
+    """Proxy realtime bytes first, then surface routing/action decisions if ready."""
+    emitted_routing = False
+    for chunk in _stream_realtime_with_action_arbitration(
+        stream,
+        action_future=action_future,
+        request_id=request_id,
+        message=message,
+        user_id=user_id,
+        action_dispatcher=action_dispatcher,
+        context=context,
+    ):
+        yield chunk
+        if not emitted_routing:
+            route_chunks = _ready_routing_chunks(route_future)
+            if route_chunks:
+                emitted_routing = True
+                for route_chunk in route_chunks:
+                    yield route_chunk
+
+    if not emitted_routing:
+        for route_chunk in _ready_routing_chunks(route_future):
+            yield route_chunk
+
 
 
 def _stream_with_embedded_action_intercept(
@@ -1213,38 +1255,28 @@ def _stream_orchestrated_conversation(
 
     action_executor: concurrent.futures.ThreadPoolExecutor | None = None
     action_future: concurrent.futures.Future[ActionIntentDecision | None] | None = None
+    route_executor: concurrent.futures.ThreadPoolExecutor | None = None
+    route_future: concurrent.futures.Future[RoutingDecision] | None = None
     if req.override != ContractConversationMode.PLANNING:
         action_executor, action_future = _start_action_decision_future(
             req.message,
             request=request,
             user_id=principal.user_id,
         )
-
-    decision = evaluate_conversation_mode(
-        req.message,
-        override=req.override.value if req.override else None,
-        context=ConversationContext(
-            recent_failures=req.recent_failures,
-            ambiguity_count=req.ambiguity_count,
-            turn_index=req.turn_index,
-        ),
+    routing_context = ConversationContext(
+        recent_failures=req.recent_failures,
+        ambiguity_count=req.ambiguity_count,
+        turn_index=req.turn_index,
     )
-    _log_classification(req.message, decision.mode, decision.confidence)
+    route_override = req.override.value if req.override else None
 
-    category = "general" if decision.mode == ConversationMode.REALTIME else "deep"
-
-    yield _sse_event(
-        "classification",
-        {
-            "category": category,
-            "mode": decision.mode.value,
-            "confidence": decision.confidence,
-            "reasons": decision.reasons,
-        },
-    )
-
-    # ── realtime: 바로 core에 위임 ─────────────────────────
-    if decision.mode == ConversationMode.REALTIME:
+    if route_override in (None, ConversationMode.REALTIME.value):
+        if route_override is None:
+            route_executor, route_future = _start_routing_decision_future(
+                req.message,
+                override=None,
+                context=routing_context,
+            )
         try:
             stream = request.app.state.core_client.chat_stream(
                 message=req.message,
@@ -1255,32 +1287,39 @@ def _stream_orchestrated_conversation(
                 user_email=getattr(principal, "email", ""),
                 request_id=request_id,
             )
-            if should_try_client_action_classifier(req.message):
-                yield from _stream_realtime_with_action_arbitration(
-                    stream,
-                    action_future=action_future,
-                    request_id=request_id,
-                    message=req.message,
+            yield from _stream_realtime_with_parallel_decisions(
+                stream,
+                action_future=action_future,
+                route_future=route_future,
+                request_id=request_id,
+                message=req.message,
+                user_id=principal.user_id,
+                action_dispatcher=request.app.state.action_dispatcher,
+                context=_client_action_context(
+                    request=request,
                     user_id=principal.user_id,
-                    action_dispatcher=request.app.state.action_dispatcher,
-                    context=_client_action_context(
-                        request=request,
-                        user_id=principal.user_id,
-                    ),
-                )
-            else:
-                for chunk in _stream_with_model_logging(
-                    stream,
-                    request_id=request_id,
-                    message=req.message,
-                ):
-                    yield chunk
+                ),
+            )
         finally:
             if action_future is not None:
                 action_future.cancel()
             if action_executor is not None:
                 action_executor.shutdown(wait=False, cancel_futures=True)
+            if route_future is not None:
+                route_future.cancel()
+            if route_executor is not None:
+                route_executor.shutdown(wait=False, cancel_futures=True)
         return
+
+    decision = evaluate_conversation_mode(
+        req.message,
+        override=route_override,
+        context=routing_context,
+    )
+    _log_classification(req.message, decision.mode, decision.confidence)
+
+    for chunk in _classification_chunks_for_decision(decision):
+        yield chunk
 
     action_decision: ActionIntentDecision | None = None
     if action_future is not None:
@@ -1826,77 +1865,38 @@ def _stream_chat_with_routing(
         request=request,
         user_id=principal.user_id,
     )
-
-    # auto 모드: realtime이면 action 판별을 기다리지 않고 core stream을 시작한다.
-    decision = evaluate_conversation_mode(req.message)
-    _log_classification(req.message, decision.mode, decision.confidence)
-
-    if decision.mode == ConversationMode.REALTIME:
-        try:
-            stream = request.app.state.core_client.chat_stream(
-                message=req.message,
-                task_type=req.task_type,
-                confirm=req.confirm,
-                route_override="realtime",
-                user_id=principal.user_id,
-                user_email=getattr(principal, "email", ""),
-                request_id=request_id,
-            )
-            yield from _stream_realtime_with_action_arbitration(
-                stream,
-                action_future=action_future,
-                request_id=request_id,
-                message=req.message,
-                user_id=principal.user_id,
-                action_dispatcher=request.app.state.action_dispatcher,
-                context=_client_action_context(
-                    request=request,
-                    user_id=principal.user_id,
-                ),
-            )
-        finally:
-            action_future.cancel()
-            action_executor.shutdown(wait=False, cancel_futures=True)
-        return
+    route_executor, route_future = _start_routing_decision_future(req.message)
 
     try:
-        action_decision = action_future.result()
-    finally:
-        action_executor.shutdown(wait=False, cancel_futures=True)
-    yield _sse_event(
-        "action_intent",
-        _action_intent_payload(
-            action_decision,
-            unavailable=action_decision is None,
-        ),
-    )
-    if _is_direct_action_decision(action_decision):
-        yield from _stream_direct_action_decision(
-            decision=action_decision,
+        stream = request.app.state.core_client.chat_stream(
             message=req.message,
+            task_type=req.task_type,
+            confirm=req.confirm,
+            route_override="realtime",
+            user_id=principal.user_id,
+            user_email=getattr(principal, "email", ""),
             request_id=request_id,
+        )
+        yield from _stream_realtime_with_parallel_decisions(
+            stream,
+            action_future=action_future,
+            route_future=route_future,
+            request_id=request_id,
+            message=req.message,
             user_id=principal.user_id,
             action_dispatcher=request.app.state.action_dispatcher,
+            context=_client_action_context(
+                request=request,
+                user_id=principal.user_id,
+            ),
         )
-        return
+    finally:
+        action_future.cancel()
+        action_executor.shutdown(wait=False, cancel_futures=True)
+        route_future.cancel()
+        route_executor.shutdown(wait=False, cancel_futures=True)
+    return
 
-    if action_decision is not None and action_decision.execution_mode == "needs_plan":
-        decision = RoutingDecision(
-            mode=ConversationMode.DEEP,
-            triggered=True,
-            confidence=action_decision.confidence,
-            reasons=[
-                "action intent requires planning: "
-                f"{action_decision.reason or action_decision.intent or 'needs_plan'}"
-            ],
-        )
-
-    # deep / planning → 깊은 생각 흐름을 ConversationRequest로 위임
-    conv_req = ConversationRequest(
-        message=req.message,
-        override=ContractConversationMode(decision.mode.value),
-    )
-    yield from _stream_orchestrated_conversation(conv_req, request, principal)
 
 
 @api_router.post("/chat/stream", tags=["chat"], summary="Stream chat response")

@@ -382,7 +382,81 @@ def test_realtime_stream_does_not_wait_for_slow_action_classifier(monkeypatch) -
     assert "event: assistant_delta" in response.text
 
 
-def test_fast_direct_action_arbitrates_before_realtime_text(monkeypatch) -> None:
+def test_conversation_stream_first_event_is_immediate(monkeypatch) -> None:
+    def slow_no_action(*args, **kwargs):
+        time.sleep(0.4)
+        return None
+
+    def slow_realtime_decision(*args, **kwargs):
+        from planner.conversation_routing import ConversationMode, RoutingDecision
+
+        time.sleep(0.4)
+        return RoutingDecision(
+            mode=ConversationMode.REALTIME,
+            triggered=False,
+            confidence=0.8,
+            reasons=["slow test routing"],
+        )
+
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        slow_no_action,
+    )
+    monkeypatch.setattr("router.router.evaluate_conversation_mode", slow_realtime_decision)
+
+    started = time.monotonic()
+    with client.stream(
+        "POST",
+        "/conversation/stream",
+        json={"message": "빠르게 일반 대화 응답해줘"},
+        headers=auth_headers(),
+    ) as response:
+        first_text = next(response.iter_text())
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert elapsed < 0.25
+    assert "event: assistant_delta" in first_text
+
+
+def test_chat_stream_auto_first_event_is_immediate(monkeypatch) -> None:
+    def slow_no_action(*args, **kwargs):
+        time.sleep(0.4)
+        return None
+
+    def slow_realtime_decision(*args, **kwargs):
+        from planner.conversation_routing import ConversationMode, RoutingDecision
+
+        time.sleep(0.4)
+        return RoutingDecision(
+            mode=ConversationMode.REALTIME,
+            triggered=False,
+            confidence=0.8,
+            reasons=["slow test routing"],
+        )
+
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        slow_no_action,
+    )
+    monkeypatch.setattr("router.router.evaluate_conversation_mode", slow_realtime_decision)
+
+    started = time.monotonic()
+    with client.stream(
+        "POST",
+        "/chat/stream",
+        json={"message": "빠르게 일반 대화 응답해줘", "thinking_mode": "auto"},
+        headers=auth_headers(),
+    ) as response:
+        first_text = next(response.iter_text())
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert elapsed < 0.25
+    assert "event: assistant_delta" in first_text
+
+
+def test_fast_direct_action_runs_after_realtime_starts(monkeypatch) -> None:
     from planner.action_intent_classifier import ActionIntentDecision
 
     action = ClientAction(
@@ -438,23 +512,37 @@ def test_fast_direct_action_arbitrates_before_realtime_text(monkeypatch) -> None
     assert response.status_code == 200
     body = response.text
     assert "event: action_dispatch" in body
-    assert "event: assistant_delta" not in body
+    assert "event: assistant_delta" in body
+    assert body.index("event: assistant_delta") < body.index("event: action_dispatch")
 
 
-def test_conversation_stream_emits_thinking_and_plan_for_deep_query() -> None:
-    response = client.post(
+def test_conversation_stream_starts_realtime_before_slow_deep_routing(monkeypatch) -> None:
+    def slow_deep_decision(*args, **kwargs):
+        from planner.conversation_routing import ConversationMode, RoutingDecision
+
+        time.sleep(0.4)
+        return RoutingDecision(
+            mode=ConversationMode.DEEP,
+            triggered=True,
+            confidence=0.95,
+            reasons=["slow deep route"],
+        )
+
+    monkeypatch.setattr("router.router.evaluate_conversation_mode", slow_deep_decision)
+
+    started = time.monotonic()
+    with client.stream(
+        "POST",
         "/conversation/stream",
         json={"message": "이 에러 로그 원인 깊게 분석해줘\nTraceback: boom"},
         headers=auth_headers(),
-    )
+    ) as response:
+        first_text = next(response.iter_text())
+    elapsed = time.monotonic() - started
 
     assert response.status_code == 200
-    body = response.text
-    assert "event: classification" in body
-    assert '"category": "deep"' in body
-    assert "event: thinking" in body
-    assert "DeepThinking..." in body
-    assert "event: plan_step" in body
+    assert elapsed < 0.25
+    assert "event: assistant_delta" in first_text
 
 
 def test_execute_mock_success() -> None:
