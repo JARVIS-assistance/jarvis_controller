@@ -294,7 +294,7 @@ def _looks_like_fast_realtime(normalized: str, original: str) -> bool:
         normalized,
         SEARCH_KEYWORDS,
     ):
-        return False
+        return _contains_phrase(normalized, REALTIME_HINTS)
     return _contains_phrase(normalized, REALTIME_HINTS)
 
 

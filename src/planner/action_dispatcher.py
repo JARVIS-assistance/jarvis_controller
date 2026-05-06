@@ -43,6 +43,7 @@ class ActionDispatcher:
             if timeout_seconds is None
             else timeout_seconds
         )
+        self.context_store = None
         self._condition = threading.Condition()
         self._queues: dict[str, deque[str]] = defaultdict(deque)
         self._records: dict[str, _ActionRecord] = {}
@@ -99,6 +100,13 @@ class ActionDispatcher:
                 error=body.error,
             )
             record.result = result
+            if self.context_store is not None:
+                self.context_store.record_action_result(
+                    user_id=user_id,
+                    action=record.envelope.action,
+                    status=result.status,
+                    output=result.output,
+                )
             self._condition.notify_all()
             return result
 

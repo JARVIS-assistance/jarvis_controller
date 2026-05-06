@@ -246,6 +246,26 @@ class CoreClient:
         )
         return result if isinstance(result, list) else []
 
+    def set_runtime_profile(
+        self, *, user_id: str, body: dict[str, object]
+    ) -> dict[str, object]:
+        result = self._request_json(
+            JarvisCoreEndpoints.INTERNAL_CLIENT_RUNTIME_PROFILE.method,
+            JarvisCoreEndpoints.INTERNAL_CLIENT_RUNTIME_PROFILE.path,
+            body=body,
+            extra_headers={"x-user-id": user_id},
+        )
+        return result if isinstance(result, dict) else {}
+
+    def get_runtime_profile(self, *, user_id: str) -> dict[str, object]:
+        result = self._request_json(
+            JarvisCoreEndpoints.INTERNAL_CLIENT_RUNTIME_PROFILE_GET.method,
+            JarvisCoreEndpoints.INTERNAL_CLIENT_RUNTIME_PROFILE_GET.path,
+            body=None,
+            extra_headers={"x-user-id": user_id},
+        )
+        return result if isinstance(result, dict) else {}
+
     # ── deepthink ───────────────────────────────────────────
 
     def deepthink_plan(
