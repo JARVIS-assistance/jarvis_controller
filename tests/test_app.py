@@ -802,6 +802,7 @@ def test_stream_recovers_invalid_embedded_action_with_action_classifier(monkeypa
 
 
 def test_stream_uses_core_model_fallback_when_action_compiler_unavailable(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_CORE_FALLBACK_ENABLED", "1")
     monkeypatch.setattr(
         "router.router.classify_client_action_intent_decision",
         lambda *args, **kwargs: None,
@@ -863,6 +864,35 @@ def test_stream_uses_core_model_fallback_when_action_compiler_unavailable(monkey
     assert "action_dispatch" in body
     assert "open_url" in body
     assert "search.naver.com" in body
+
+
+def test_stream_does_not_call_core_action_fallback_by_default(monkeypatch) -> None:
+    monkeypatch.delenv("JARVIS_ACTION_INTENT_CORE_FALLBACK_ENABLED", raising=False)
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        lambda *args, **kwargs: None,
+    )
+    original_chat_request = stub_core_client.chat_request
+    calls = 0
+
+    def fake_chat_request(**kwargs):
+        nonlocal calls
+        calls += 1
+        return original_chat_request(**kwargs)
+
+    stub_core_client.chat_request = fake_chat_request
+    try:
+        response = client.post(
+            "/conversation/stream",
+            json={"message": "다시 대답해봐"},
+            headers=auth_headers(),
+        )
+    finally:
+        stub_core_client.chat_request = original_chat_request
+
+    assert response.status_code == 200
+    assert calls == 0
+    assert "event: assistant_delta" in response.text
 
 
 def test_stream_failed_client_action_does_not_emit_success(monkeypatch) -> None:

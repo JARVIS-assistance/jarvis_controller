@@ -72,6 +72,7 @@ api_router = APIRouter()
 bearer_scheme = HTTPBearer(auto_error=False)
 _ACTION_ARBITRATION_BUFFER_SECONDS = "JARVIS_ACTION_ARBITRATION_BUFFER_SECONDS"
 _ACTION_ARBITRATION_DEFAULT_SECONDS = 0.0
+_ACTION_INTENT_CORE_FALLBACK_ENABLED = "JARVIS_ACTION_INTENT_CORE_FALLBACK_ENABLED"
 TokenAuth = Annotated[
     HTTPAuthorizationCredentials | None,
     Depends(bearer_scheme),
@@ -269,6 +270,15 @@ def _action_arbitration_buffer_seconds() -> float:
         _ACTION_ARBITRATION_BUFFER_SECONDS,
         _ACTION_ARBITRATION_DEFAULT_SECONDS,
     ))
+
+
+def _action_intent_core_fallback_enabled() -> bool:
+    return os.getenv(_ACTION_INTENT_CORE_FALLBACK_ENABLED, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _resolve_client_action_decision(
@@ -968,6 +978,8 @@ def _client_action_decision_via_core_model(
     context: dict[str, object] | None,
     validation_errors: list[object] | None = None,
 ) -> ActionIntentDecision | None:
+    if not _action_intent_core_fallback_enabled():
+        return None
     if request is None or not user_id:
         return None
     core_client = getattr(request.app.state, "core_client", None)
