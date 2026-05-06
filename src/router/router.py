@@ -73,6 +73,8 @@ bearer_scheme = HTTPBearer(auto_error=False)
 _ACTION_ARBITRATION_BUFFER_SECONDS = "JARVIS_ACTION_ARBITRATION_BUFFER_SECONDS"
 _ACTION_ARBITRATION_DEFAULT_SECONDS = 0.0
 _ACTION_INTENT_CORE_FALLBACK_ENABLED = "JARVIS_ACTION_INTENT_CORE_FALLBACK_ENABLED"
+_ACTION_INTENT_DONE_GRACE_SECONDS = "JARVIS_ACTION_INTENT_DONE_GRACE_SECONDS"
+_ACTION_INTENT_DONE_GRACE_DEFAULT_SECONDS = 0.05
 TokenAuth = Annotated[
     HTTPAuthorizationCredentials | None,
     Depends(bearer_scheme),
@@ -281,6 +283,21 @@ def _action_intent_core_fallback_enabled() -> bool:
     }
 
 
+def _action_intent_done_grace_seconds() -> float:
+    return max(0.0, _float_env(
+        _ACTION_INTENT_DONE_GRACE_SECONDS,
+        _ACTION_INTENT_DONE_GRACE_DEFAULT_SECONDS,
+    ))
+
+
+def _is_assistant_done_chunk(chunk: bytes) -> bool:
+    try:
+        text = chunk.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return "event: assistant_done" in text or "event: conversation.done" in text
+
+
 def _resolve_client_action_decision(
     message: str,
     *,
@@ -374,15 +391,26 @@ def _stream_realtime_with_action_arbitration(
     """Stream core bytes immediately while action classification runs in parallel."""
     emitted_action_intent = False
 
-    def ready_decision_chunks() -> tuple[list[bytes], bool]:
+    def ready_decision_chunks(*, timeout: float = 0.0) -> tuple[list[bytes], bool]:
         nonlocal emitted_action_intent
-        if action_future is None or emitted_action_intent or not action_future.done():
+        if action_future is None or emitted_action_intent:
             return [], False
-        try:
-            decision = action_future.result()
-        except Exception as exc:
-            logger.warning("action intent decision failed after stream start: %s", exc)
-            decision = None
+        if not action_future.done():
+            if timeout <= 0:
+                return [], False
+            try:
+                decision = action_future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                return [], False
+            except Exception as exc:
+                logger.warning("action intent decision failed after stream start: %s", exc)
+                decision = None
+        else:
+            try:
+                decision = action_future.result()
+            except Exception as exc:
+                logger.warning("action intent decision failed after stream start: %s", exc)
+                decision = None
 
         emitted_action_intent = True
         chunks = [_sse_event(
@@ -411,6 +439,17 @@ def _stream_realtime_with_action_arbitration(
             action_dispatcher=action_dispatcher,
             context=context,
         ):
+            if _is_assistant_done_chunk(chunk):
+                decision_chunks, stopped = ready_decision_chunks(
+                    timeout=_action_intent_done_grace_seconds(),
+                )
+                for decision_chunk in decision_chunks:
+                    yield decision_chunk
+                yield chunk
+                if stopped:
+                    return
+                continue
+
             yield chunk
             decision_chunks, stopped = ready_decision_chunks()
             for decision_chunk in decision_chunks:

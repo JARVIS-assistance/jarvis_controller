@@ -516,6 +516,82 @@ def test_fast_direct_action_runs_after_realtime_starts(monkeypatch) -> None:
     assert body.index("event: assistant_delta") < body.index("event: action_dispatch")
 
 
+def test_direct_action_ready_at_done_emits_before_assistant_done(monkeypatch) -> None:
+    from planner.action_intent_classifier import ActionIntentDecision
+
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_DONE_GRACE_SECONDS", "0.5")
+
+    action = ClientAction(
+        type="open_url",
+        command=None,
+        target="about:blank",
+        args={"browser": "default"},
+        description="open browser",
+        requires_confirm=False,
+    )
+
+    def slow_action(*args, **kwargs):
+        time.sleep(0.15)
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="browser.open",
+            confidence=0.9,
+            reason="model action",
+            actions=[action],
+        )
+
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        slow_action,
+    )
+
+    original_chat_stream = stub_core_client.chat_stream
+
+    def fast_done_stream(**kwargs):
+        yield b'event: assistant_delta\ndata: {"content":"stub "}\n\n'
+        yield b'event: assistant_done\ndata: {"content":"stub response"}\n\n'
+
+    class CompletedDispatcher:
+        context_store = None
+
+        def enqueue(self, *, user_id, request_id, action):
+            return ClientActionEnvelope(
+                action_id="act_done_grace",
+                request_id=request_id,
+                action=action,
+            )
+
+        def wait_for_result(self, *, action_id, request_id, timeout_seconds=None):
+            return ClientActionResult(
+                action_id=action_id,
+                request_id=request_id,
+                status="completed",
+                output={"ok": True},
+            )
+
+    stub_core_client.chat_stream = fast_done_stream
+    original_dispatcher = client.app.state.action_dispatcher
+    client.app.state.action_dispatcher = CompletedDispatcher()
+    try:
+        response = client.post(
+            "/conversation/stream",
+            json={"message": "브라우저 열어줘"},
+            headers=auth_headers(),
+        )
+    finally:
+        stub_core_client.chat_stream = original_chat_stream
+        client.app.state.action_dispatcher = original_dispatcher
+
+    assert response.status_code == 200
+    body = response.text
+    assert "event: assistant_delta" in body
+    assert "event: action_dispatch" in body
+    assert "event: assistant_done" in body
+    assert body.index("event: assistant_delta") < body.index("event: action_dispatch")
+    assert body.index("event: action_dispatch") < body.index("event: assistant_done")
+
+
 def test_conversation_stream_starts_realtime_before_slow_deep_routing(monkeypatch) -> None:
     def slow_deep_decision(*args, **kwargs):
         from planner.conversation_routing import ConversationMode, RoutingDecision
