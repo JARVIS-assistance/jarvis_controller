@@ -1,3 +1,5 @@
+import time
+
 from fastapi.testclient import TestClient
 from jarvis_contracts import (
     ClientAction,
@@ -354,6 +356,89 @@ def test_conversation_stream_emits_classification_for_general_query() -> None:
     assert "event: assistant_delta" in body
     assert stub_core_client.last_chat_stream_request is not None
     assert stub_core_client.last_chat_stream_request["route_override"] == "realtime"
+
+
+def test_realtime_stream_does_not_wait_for_slow_action_classifier(monkeypatch) -> None:
+    def slow_no_action(*args, **kwargs):
+        time.sleep(0.4)
+        return None
+
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        slow_no_action,
+    )
+    monkeypatch.setenv("JARVIS_ACTION_ARBITRATION_BUFFER_SECONDS", "0.01")
+
+    started = time.monotonic()
+    response = client.post(
+        "/conversation/stream",
+        json={"message": "빠르게 일반 대화 응답해줘"},
+        headers=auth_headers(),
+    )
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert elapsed < 0.25
+    assert "event: assistant_delta" in response.text
+
+
+def test_fast_direct_action_arbitrates_before_realtime_text(monkeypatch) -> None:
+    from planner.action_intent_classifier import ActionIntentDecision
+
+    action = ClientAction(
+        type="open_url",
+        command=None,
+        target="https://example.com",
+        args={},
+        description="open example",
+        requires_confirm=False,
+    )
+
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        lambda *args, **kwargs: ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="open_url",
+            confidence=0.9,
+            reason="model action",
+            actions=[action],
+        ),
+    )
+
+    class CompletedDispatcher:
+        context_store = None
+
+        def enqueue(self, *, user_id, request_id, action):
+            return ClientActionEnvelope(
+                action_id="act_parallel",
+                request_id=request_id,
+                action=action,
+            )
+
+        def wait_for_result(self, *, action_id, request_id, timeout_seconds=None):
+            return ClientActionResult(
+                action_id=action_id,
+                request_id=request_id,
+                status="completed",
+                output={"ok": True},
+            )
+
+    original_dispatcher = client.app.state.action_dispatcher
+    client.app.state.action_dispatcher = CompletedDispatcher()
+    try:
+        response = client.post(
+            "/conversation/stream",
+            json={"message": "example.com 열어줘"},
+            headers=auth_headers(),
+        )
+    finally:
+        client.app.state.action_dispatcher = original_dispatcher
+
+    assert response.status_code == 200
+    body = response.text
+    assert "event: action_dispatch" in body
+    assert "event: assistant_delta" not in body
 
 
 def test_conversation_stream_emits_thinking_and_plan_for_deep_query() -> None:
