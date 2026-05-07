@@ -1,5 +1,5 @@
 from jarvis_controller.planner.conversation_orchestrator import orchestrate_conversation_turn
-from jarvis_controller.router.conversation_routing import ConversationMode
+from jarvis_controller.planner.conversation_routing import ConversationMode
 
 
 class StubCoreClient:

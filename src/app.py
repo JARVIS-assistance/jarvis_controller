@@ -3,14 +3,39 @@ from pathlib import Path
 
 from fastapi import FastAPI
 
-from middleware.core_client import CoreClient
 from middleware.auth_middleware import GatewayAuthMiddleware
+from middleware.core_client import CoreClient
 from middleware.gateway_client import GatewayClient
 from planner.action_context import ActionContextStore
 from planner.action_dispatcher import ActionDispatcher
-from router.router import api_router
+from router.router import _action_runtime_config_payload, api_router
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("jarvis_controller.app")
+
+
+class SuppressPendingActionPollAccessLog(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args if isinstance(record.args, tuple) else ()
+        if len(args) >= 5:
+            method = str(args[1])
+            path = str(args[2])
+            status_code = args[4]
+            if (
+                method == "GET"
+                and path.startswith("/client/actions/pending")
+                and status_code == 200
+            ):
+                return False
+
+        message = record.getMessage()
+        return not (
+            '"GET /client/actions/pending' in message
+            and '" 200' in message
+        )
+
+
+logging.getLogger("uvicorn.access").addFilter(SuppressPendingActionPollAccessLog())
 
 try:
     from dotenv import load_dotenv
@@ -90,6 +115,7 @@ def create_app(
     app.state.action_dispatcher.context_store = app.state.action_context
     app.add_middleware(GatewayAuthMiddleware, gateway_client=app.state.gateway_client)
     app.include_router(api_router)
+    logger.info("action runtime config=%s", _action_runtime_config_payload())
     return app
 
 

@@ -106,6 +106,7 @@ class ActionDispatcher:
                     action=record.envelope.action,
                     status=result.status,
                     output=result.output,
+                    action_id=action_id,
                 )
             self._condition.notify_all()
             return result

@@ -173,6 +173,21 @@ class CoreClient:
             extra_headers={"x-user-id": user_id},
         )
 
+    def delete_model_config(
+        self,
+        *,
+        user_id: str,
+        model_config_id: str,
+    ) -> dict[str, object]:
+        return self._request_json(
+            "DELETE",
+            JarvisCoreEndpoints.INTERNAL_CHAT_MODEL_CONFIG_DELETE.path.format(
+                model_config_id=model_config_id
+            ),
+            body=None,
+            extra_headers={"x-user-id": user_id},
+        )
+
     def set_model_selection(self, *, user_id: str, body: dict[str, object]) -> dict[str, object]:
         return self._request_json(
             "POST",

@@ -82,6 +82,7 @@ def test_empty_message_skips_client_action_classifier() -> None:
 
 
 def test_plain_message_returns_model_no_action(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
     monkeypatch.setattr(
         "planner.action_compiler._post_json",
         lambda *args, **kwargs: {
@@ -89,7 +90,7 @@ def test_plain_message_returns_model_no_action(monkeypatch) -> None:
                 {
                     "message": {
                         "content": (
-                            '{"mode":"no_action","goal":null,'
+                            '{"should_act":false,"intent":"none",'
                             '"confidence":0.94,"reason":"ordinary chat",'
                             '"actions":[]}'
                         )

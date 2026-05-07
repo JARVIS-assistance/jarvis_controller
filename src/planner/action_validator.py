@@ -142,6 +142,23 @@ class ActionValidator:
                     details={"target": action.target},
                 )
             )
+        elif action.name in {"app.open", "app.focus"} and not _known_application_target(
+            action.target,
+            context,
+        ):
+            issues.append(
+                _issue(
+                    "unknown_application_target",
+                    "app.open/app.focus target must match an available application name",
+                    action_index=index,
+                    action_name=action.name,
+                    field="target",
+                    details={
+                        "target": action.target,
+                        "available_applications": _available_application_names(context),
+                    },
+                )
+            )
 
         issues.extend(_required_v2_args(action, index=index))
 
@@ -193,6 +210,20 @@ class ActionValidator:
                         details={"target": action.target},
                     )
                 )
+            elif not _known_application_target(action.target, context):
+                issues.append(
+                    _issue(
+                        "unknown_application_target",
+                        "app_control/open target must match an available application name",
+                        action_index=index,
+                        action_name=action.type,
+                        field="target",
+                        details={
+                            "target": action.target,
+                            "available_applications": _available_application_names(context),
+                        },
+                    )
+                )
 
         if (action.type, action.command) in RISKY_V1_ACTIONS:
             action.requires_confirm = True
@@ -221,32 +252,40 @@ def _required_v2_args(
                 )
             )
 
+    def require_positive_int(field: str) -> None:
+        value = args.get(field)
+        if not isinstance(value, int):
+            issues.append(
+                _issue(
+                    "missing_required_field",
+                    f"{action.name} requires args.{field}",
+                    action_index=index,
+                    action_name=action.name,
+                    field=f"args.{field}",
+                    details={"value": value, "expected": "integer >= 1"},
+                )
+            )
+            return
+        if value < 1:
+            issues.append(
+                _issue(
+                    "invalid_argument",
+                    f"{action.name} args.{field} must be >= 1",
+                    action_index=index,
+                    action_name=action.name,
+                    field=f"args.{field}",
+                    details={"value": value, "minimum": 1},
+                )
+            )
+
     if action.name == "browser.navigate":
         require_string("url")
     elif action.name == "browser.search":
         require_string("query")
     elif action.name == "browser.click":
-        if not isinstance(args.get("ai_id"), int):
-            issues.append(
-                _issue(
-                    "missing_required_field",
-                    "browser.click requires args.ai_id",
-                    action_index=index,
-                    action_name=action.name,
-                    field="args.ai_id",
-                )
-            )
+        require_positive_int("ai_id")
     elif action.name == "browser.type":
-        if not isinstance(args.get("ai_id"), int):
-            issues.append(
-                _issue(
-                    "missing_required_field",
-                    "browser.type requires args.ai_id",
-                    action_index=index,
-                    action_name=action.name,
-                    field="args.ai_id",
-                )
-            )
+        require_positive_int("ai_id")
         text = args.get("text") or action.payload
         if not isinstance(text, str) or not text:
             issues.append(
@@ -259,16 +298,7 @@ def _required_v2_args(
                 )
             )
     elif action.name == "browser.select_result":
-        if not isinstance(args.get("index"), int):
-            issues.append(
-                _issue(
-                    "missing_required_field",
-                    "browser.select_result requires args.index",
-                    action_index=index,
-                    action_name=action.name,
-                    field="args.index",
-                )
-            )
+        require_positive_int("index")
     elif action.name in {"app.open", "app.focus"}:
         if not isinstance(action.target, str) or not action.target.strip():
             issues.append(
@@ -402,6 +432,7 @@ def _v1_capability_candidates(
 ) -> tuple[str, ...]:
     mapped = {
         "open_url": ("browser", "browser.open", "browser.navigate", "open_url"),
+        "browser": ("browser", f"browser.{command}"),
         "browser_control": ("browser", "browser_control"),
         "app_control": ("app", f"app.{command}", "app_control"),
         "keyboard_type": ("keyboard", "keyboard.type", "keyboard_type"),
@@ -448,6 +479,43 @@ def _abstract_app_target(target: str | None) -> bool:
         return False
     normalized = "".join(ch for ch in target.lower() if ch.isalnum() or ch == "_")
     return normalized in ABSTRACT_APP_TARGETS
+
+
+def _known_application_target(
+    target: str | None,
+    context: dict[str, Any] | None,
+) -> bool:
+    known_values = _available_application_names(context)
+    if not known_values:
+        return True
+    if not isinstance(target, str) or not target.strip():
+        return False
+    normalized_target = target.strip().casefold()
+    return normalized_target in {name.casefold() for name in known_values}
+
+
+def _available_application_names(context: dict[str, Any] | None) -> list[str]:
+    raw = (context or {}).get("available_applications")
+    names: list[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, str):
+                names.append(item)
+            elif isinstance(item, dict):
+                name = item.get("name")
+                if isinstance(name, str) and name.strip():
+                    names.append(name.strip())
+                aliases = item.get("aliases")
+                if isinstance(aliases, list):
+                    names.extend(
+                        alias.strip()
+                        for alias in aliases
+                        if isinstance(alias, str) and alias.strip()
+                    )
+    raw_names = (context or {}).get("available_application_names")
+    if isinstance(raw_names, list):
+        names.extend(item for item in raw_names if isinstance(item, str))
+    return list(dict.fromkeys(name for name in names if name.strip()))
 
 
 def _issue(

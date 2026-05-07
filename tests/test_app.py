@@ -1,3 +1,5 @@
+import logging
+import json
 import time
 
 from fastapi.testclient import TestClient
@@ -11,9 +13,35 @@ from jarvis_contracts import (
     DeepThinkStepResult,
     JarvisCoreEndpoints,
 )
-from jarvis_controller.app import create_app
+from jarvis_controller.app import SuppressPendingActionPollAccessLog, create_app
 from jarvis_controller.middleware.core_client import CoreResponse
 from jarvis_controller.middleware.gateway_client import GatewayPrincipal
+
+from router.router import _client_action_context
+
+
+def _collect_events(body: str) -> list[tuple[str, dict[str, object]]]:
+    events: list[tuple[str, dict[str, object]]] = []
+    current_event: str | None = None
+    data_lines: list[str] = []
+
+    for line in body.splitlines():
+        if line.startswith("event:"):
+            current_event = line[len("event:") :].strip()
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line[len("data:") :].strip())
+            continue
+        if not line and current_event:
+            payload = json.loads("\n".join(data_lines) or "{}")
+            events.append((current_event, payload))
+            current_event = None
+            data_lines = []
+
+    if current_event and data_lines:
+        payload = json.loads("\n".join(data_lines) or "{}")
+        events.append((current_event, payload))
+    return events
 
 
 class StubGatewayClient:
@@ -164,6 +192,16 @@ class StubCoreClient:
         assert model_config_id == "mc1"
         return {"id": model_config_id, **body, "is_active": True}
 
+    def delete_model_config(
+        self,
+        *,
+        user_id: str,
+        model_config_id: str,
+    ) -> dict[str, object]:
+        assert user_id == "u1"
+        assert model_config_id == "mc1"
+        return {"id": model_config_id, "deleted": True}
+
     def chat_stream(
         self,
         *,
@@ -201,6 +239,7 @@ def test_health() -> None:
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    assert response.json()["action_runtime"]["core_fallback_enabled"] is True
 
 
 def test_swagger_docs_are_public() -> None:
@@ -292,6 +331,14 @@ def test_update_model_config_proxies_to_core() -> None:
     assert payload["model_name"] == "docker.io/ai/gemma3-qat:4B"
 
 
+def test_delete_model_config_proxies_to_core() -> None:
+    response = client.delete("/chat/model-config/mc1", headers=auth_headers())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload == {"id": "mc1", "deleted": True}
+
+
 def test_chat_request_can_escalate_to_deep() -> None:
     response = client.post(
         "/chat/request",
@@ -368,6 +415,7 @@ def test_realtime_stream_does_not_wait_for_slow_action_classifier(monkeypatch) -
         slow_no_action,
     )
     monkeypatch.setenv("JARVIS_ACTION_ARBITRATION_BUFFER_SECONDS", "0.01")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_DONE_GRACE_SECONDS", "0.01")
 
     started = time.monotonic()
     response = client.post(
@@ -403,6 +451,7 @@ def test_conversation_stream_first_event_is_immediate(monkeypatch) -> None:
         slow_no_action,
     )
     monkeypatch.setattr("router.router.evaluate_conversation_mode", slow_realtime_decision)
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_DONE_GRACE_SECONDS", "0.01")
 
     started = time.monotonic()
     with client.stream(
@@ -420,6 +469,8 @@ def test_conversation_stream_first_event_is_immediate(monkeypatch) -> None:
 
 
 def test_chat_stream_auto_first_event_is_immediate(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_DONE_GRACE_SECONDS", "0.01")
+
     def slow_no_action(*args, **kwargs):
         time.sleep(0.4)
         return None
@@ -513,7 +564,8 @@ def test_fast_direct_action_runs_after_realtime_starts(monkeypatch) -> None:
     body = response.text
     assert "event: action_dispatch" in body
     assert "event: assistant_delta" in body
-    assert body.index("event: assistant_delta") < body.index("event: action_dispatch")
+    assert "진행하겠습니다!" in body
+    assert body.index("진행하겠습니다!") < body.index("event: action_dispatch")
 
 
 def test_direct_action_ready_at_done_emits_before_assistant_done(monkeypatch) -> None:
@@ -588,11 +640,118 @@ def test_direct_action_ready_at_done_emits_before_assistant_done(monkeypatch) ->
     assert "event: assistant_delta" in body
     assert "event: action_dispatch" in body
     assert "event: assistant_done" in body
-    assert body.index("event: assistant_delta") < body.index("event: action_dispatch")
+    assert "진행하겠습니다!" in body
+    assert body.index("진행하겠습니다!") < body.index("event: action_dispatch")
     assert body.index("event: action_dispatch") < body.index("event: assistant_done")
 
 
+def test_stream_realtime_emits_text_plan_step_progress(monkeypatch) -> None:
+    original_chat_stream = stub_core_client.chat_stream
+    try:
+        monkeypatch.setattr(
+            "router.router.classify_client_action_intent_decision",
+            lambda *args, **kwargs: None,
+        )
+        def fake_chat_stream(**kwargs):
+            yield b'event: assistant_delta\ndata: {"content":"hello "}\n\n'
+            yield b'event: assistant_done\ndata: {"content":"hello world"}\n\n'
+
+        stub_core_client.chat_stream = fake_chat_stream
+        response = client.post(
+            "/conversation/stream",
+            json={"message": "안녕"},
+            headers=auth_headers(),
+        )
+
+        assert response.status_code == 200
+        events = _collect_events(response.text)
+        event_types = [event for event, _ in events]
+        assert "assistant_delta" in event_types
+        assert "assistant_done" in event_types
+        assert "plan_step" in event_types
+
+        plan_steps = [payload for event, payload in events if event == "plan_step"]
+        assert any(step.get("status") == "in_progress" for step in plan_steps)
+        assert any(step.get("status") == "completed" for step in plan_steps)
+    finally:
+        stub_core_client.chat_stream = original_chat_stream
+
+
+def test_stream_direct_action_emits_plan_steps(monkeypatch) -> None:
+    from planner.action_intent_classifier import ActionIntentDecision
+
+    action = ClientAction(
+        type="open_url",
+        command=None,
+        target="https://example.com",
+        args={"browser": "default"},
+        description="open example page",
+        requires_confirm=False,
+    )
+
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        lambda *args, **kwargs: ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="open_url",
+            confidence=0.9,
+            reason="test action",
+            actions=[action],
+        ),
+    )
+
+    class CompletedDispatcher:
+        context_store = None
+
+        def enqueue(self, *, user_id, request_id, action):
+            return ClientActionEnvelope(
+                action_id="act_direct_steps",
+                request_id=request_id,
+                action=action,
+            )
+
+        def wait_for_result(self, *, action_id, request_id, timeout_seconds=None):
+            return ClientActionResult(
+                action_id=action_id,
+                request_id=request_id,
+                status="completed",
+                output={"ok": True},
+            )
+
+    original_dispatcher = client.app.state.action_dispatcher
+    original_chat_stream = stub_core_client.chat_stream
+    try:
+        stub_core_client.chat_stream = lambda **kwargs: iter(())
+        client.app.state.action_dispatcher = CompletedDispatcher()
+
+        response = client.post(
+            "/conversation/stream",
+            json={"message": "sublimetext 켜서 안녕"},
+            headers=auth_headers(),
+        )
+    finally:
+        stub_core_client.chat_stream = original_chat_stream
+        client.app.state.action_dispatcher = original_dispatcher
+
+    assert response.status_code == 200
+    events = _collect_events(response.text)
+    plan_steps = [payload for event, payload in events if event == "plan_step"]
+    assert plan_steps
+    step_ids = [step.get("id") for step in plan_steps]
+    assert "act_direct_steps" in step_ids
+    direct_steps = [step for step in plan_steps if step.get("id") == "act_direct_steps"]
+    assert any(step.get("status") == "queued" for step in direct_steps)
+    assert any(step.get("status") == "in_progress" for step in direct_steps)
+    assert any(step.get("status") == "completed" for step in direct_steps)
+    direct_statuses = [step.get("status") for step in direct_steps]
+    assert direct_statuses.index("queued") < direct_statuses.index("in_progress")
+    assert direct_statuses.index("in_progress") < direct_statuses.index("completed")
+
+
 def test_conversation_stream_starts_realtime_before_slow_deep_routing(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_DONE_GRACE_SECONDS", "0.01")
+
     def slow_deep_decision(*args, **kwargs):
         from planner.conversation_routing import ConversationMode, RoutingDecision
 
@@ -744,6 +903,56 @@ def test_client_screenshot_result_updates_latest_observation_state() -> None:
     assert latest_observation.output["summary"] == "desktop"
 
 
+def test_client_action_context_includes_working_context() -> None:
+    client.app.state.action_context.record_action_result(
+        user_id="u1",
+        action=ClientAction(
+            type="app_control",
+            command="open",
+            target="Sublime Text",
+            args={},
+            description="Open Sublime Text",
+            requires_confirm=False,
+        ),
+        status="completed",
+        output={},
+        action_id="act_context_app",
+    )
+    client.app.state.action_context.record_action_result(
+        user_id="u1",
+        action=ClientAction(
+            type="keyboard_type",
+            command=None,
+            target=None,
+            payload="안녕하세요. 저는 JARVIS입니다.",
+            args={"enter": False},
+            description="Type introduction",
+            requires_confirm=False,
+        ),
+        status="completed",
+        output={},
+        action_id="act_context_type",
+    )
+
+    request = type(
+        "Request",
+        (),
+        {
+            "app": client.app,
+            "headers": {},
+        },
+    )()
+
+    context = _client_action_context(request=request, user_id="u1")
+
+    assert context is not None
+    working_context = context["working_context"]
+    assert isinstance(working_context, dict)
+    assert working_context["active_app"] == "Sublime Text"
+    assert working_context["last_typed_text"] == "안녕하세요. 저는 JARVIS입니다."
+    assert working_context["last_typed_target"] == "Sublime Text"
+
+
 def test_stream_suppresses_invalid_embedded_browser_app_action(monkeypatch) -> None:
     monkeypatch.setattr(
         "router.router.classify_client_action_intent_decision",
@@ -797,6 +1006,98 @@ def test_stream_suppresses_invalid_embedded_browser_app_action(monkeypatch) -> N
     assert "embedded assistant action suppressed" in body
     assert "실행할 액션을 큐에 넣지 못해 실행하지 않았습니다." in body
     assert "action_dispatch" not in body
+
+
+def test_stream_suppresses_valid_embedded_action_block_without_backend_queue(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        lambda *args, **kwargs: None,
+    )
+    original_chat_stream = stub_core_client.chat_stream
+
+    def fake_chat_stream(**kwargs):
+        yield (
+            b"event: assistant_done\n"
+            b'data: {"content":"```actions\\n'
+            b'{\\"name\\":\\"browser.search\\",'
+            b'\\"args\\":{\\"query\\":\\"salmon\\"},'
+            b'\\"description\\":\\"search salmon\\",'
+            b'\\"requires_confirm\\":false}'
+            b'\\n```"}\n\n'
+        )
+
+    class FailIfQueuedDispatcher:
+        context_store = None
+
+        def enqueue(self, *, user_id, request_id, action):
+            raise AssertionError("embedded assistant text must not be queued")
+
+        def wait_for_result(self, *, action_id, request_id, timeout_seconds=None):
+            raise AssertionError("embedded assistant text must not run")
+
+    stub_core_client.chat_stream = fake_chat_stream
+    original_dispatcher = client.app.state.action_dispatcher
+    client.app.state.action_dispatcher = FailIfQueuedDispatcher()
+    try:
+        response = client.post(
+            "/conversation/stream",
+            json={"message": "브라우저에서 연어장 검색해줘"},
+            headers={
+                **auth_headers(),
+                "x-client-enabled-capabilities": "browser.search,browser.navigate,browser.open",
+            },
+        )
+    finally:
+        stub_core_client.chat_stream = original_chat_stream
+        client.app.state.action_dispatcher = original_dispatcher
+
+    assert response.status_code == 200
+    body = response.text
+    assert "embedded assistant action suppressed" in body
+    assert "compiler_unavailable" in body
+    assert "action_dispatch" not in body
+
+
+def test_stream_suppresses_bash_action_block_without_backend_queue(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        lambda *args, **kwargs: None,
+    )
+    original_chat_stream = stub_core_client.chat_stream
+
+    def fake_chat_stream(**kwargs):
+        yield (
+            b"event: assistant_done\n"
+            b'data: {"content":"open it\\n```bash\\nopen https://example.com\\n```"}\n\n'
+        )
+
+    class FailIfQueuedDispatcher:
+        context_store = None
+
+        def enqueue(self, *, user_id, request_id, action):
+            raise AssertionError("assistant bash text must not be queued")
+
+        def wait_for_result(self, *, action_id, request_id, timeout_seconds=None):
+            raise AssertionError("assistant bash text must not run")
+
+    stub_core_client.chat_stream = fake_chat_stream
+    original_dispatcher = client.app.state.action_dispatcher
+    client.app.state.action_dispatcher = FailIfQueuedDispatcher()
+    try:
+        response = client.post(
+            "/conversation/stream",
+            json={"message": "브라우저에서 example 검색해줘"},
+            headers=auth_headers(),
+        )
+    finally:
+        stub_core_client.chat_stream = original_chat_stream
+        client.app.state.action_dispatcher = original_dispatcher
+
+    assert response.status_code == 200
+    body = response.text
+    assert "embedded assistant action suppressed" in body
+    assert "action_dispatch" not in body
+    assert "open https://example.com" not in body
 
 
 def test_stream_recovers_invalid_embedded_action_with_action_classifier(monkeypatch) -> None:
@@ -942,8 +1243,34 @@ def test_stream_uses_core_model_fallback_when_action_compiler_unavailable(monkey
     assert "search.naver.com" in body
 
 
-def test_stream_does_not_call_core_action_fallback_by_default(monkeypatch) -> None:
-    monkeypatch.delenv("JARVIS_ACTION_INTENT_CORE_FALLBACK_ENABLED", raising=False)
+def test_action_context_trims_large_application_list_to_message_mentions() -> None:
+    from router.router import _trim_action_context_for_message
+
+    context = {
+        "available_applications": [
+            "Google Chrome",
+            "Sublime Text",
+            *[f"App {index}" for index in range(40)],
+        ],
+        "available_application_names": [
+            "Google Chrome",
+            "Sublime Text",
+            *[f"App {index}" for index in range(40)],
+        ],
+    }
+
+    trimmed = _trim_action_context_for_message(
+        context,
+        "Sublime Text 열어서 안녕하세요 작성해줘",
+    )
+
+    assert trimmed is not None
+    assert trimmed["available_applications"] == ["Sublime Text"]
+    assert trimmed["available_application_names"] == ["Sublime Text"]
+
+
+def test_stream_can_disable_core_action_fallback(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_CORE_FALLBACK_ENABLED", "0")
     monkeypatch.setattr(
         "router.router.classify_client_action_intent_decision",
         lambda *args, **kwargs: None,
@@ -969,6 +1296,7 @@ def test_stream_does_not_call_core_action_fallback_by_default(monkeypatch) -> No
     assert response.status_code == 200
     assert calls == 0
     assert "event: assistant_delta" in response.text
+    assert "compiler_unavailable" in response.text
 
 
 def test_stream_failed_client_action_does_not_emit_success(monkeypatch) -> None:
@@ -1066,3 +1394,28 @@ def test_signup_is_public() -> None:
 
     assert response.status_code == 200
     assert response.json()["user_id"] == "u2"
+
+
+def test_pending_action_poll_access_log_filter_suppresses_success() -> None:
+    access_filter = SuppressPendingActionPollAccessLog()
+    pending_record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=("127.0.0.1:51235", "GET", "/client/actions/pending?limit=20", "1.1", 200),
+        exc_info=None,
+    )
+    error_record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg='%s - "%s %s HTTP/%s" %d',
+        args=("127.0.0.1:51235", "GET", "/client/actions/pending?limit=20", "1.1", 500),
+        exc_info=None,
+    )
+
+    assert access_filter.filter(pending_record) is False
+    assert access_filter.filter(error_record) is True

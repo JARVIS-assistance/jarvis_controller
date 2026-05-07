@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Generator
 from typing import Any
 
@@ -31,6 +32,31 @@ def format_action_context(
         f"결과: {json.dumps(output, ensure_ascii=False)}\n"
         f"오류: {error or ''}"
     )
+
+
+def _action_plan_step_payload(
+    action: ClientAction,
+    *,
+    action_id: str,
+    status: str,
+    request_id: str,
+) -> dict[str, object]:
+    title = action.description.strip() if action.description else ""
+    if not title:
+        title = f"{action.type}/{action.command}" if action.command else action.type
+    return {
+        "id": action_id,
+        "title": title[:120],
+        "description": action.description or f"{action.type} 액션 실행",
+        "status": status,
+        "request_id": request_id,
+    }
+
+
+def _normalize_plan_step_status(action_status: str) -> str:
+    if action_status in {"completed", "failed", "rejected", "timeout", "invalid"}:
+        return action_status
+    return "failed"
 
 
 def action_result_payload(
@@ -121,36 +147,13 @@ def stream_dispatched_actions(
     done_summary: str,
 ) -> Generator[bytes, None, None]:
     action_results: list[dict[str, object]] = []
-    pending_actions = list(actions)
-    while pending_actions:
-        action = pending_actions.pop(0)
-        envelope = action_dispatcher.enqueue(
-            user_id=user_id,
-            request_id=request_id,
-            action=action,
-        )
-        yield sse_event("action_dispatch", envelope.model_dump())
-        action_result = action_dispatcher.wait_for_result(
-            action_id=envelope.action_id,
-            request_id=request_id,
-        )
-        action_payload = action_result_payload(envelope, action_result, action)
-        action_results.append(action_payload)
-        yield sse_event("action_result", action_payload)
-        record_action_context(
-            action_dispatcher=action_dispatcher,
-            user_id=user_id,
-            action=action,
-            status=action_result.status,
-            output=action_result.output,
-        )
-        follow_up = follow_up_action_from_result(
-            action,
-            status=action_result.status,
-            output=action_result.output,
-        )
-        if follow_up is not None:
-            pending_actions.append(follow_up)
+    yield from stream_action_dispatch_events(
+        actions=actions,
+        request_id=request_id,
+        user_id=user_id,
+        action_dispatcher=action_dispatcher,
+        action_results=action_results,
+    )
 
     yield sse_event(
         "actions",
@@ -182,12 +185,99 @@ def stream_dispatched_actions(
     )
 
 
+def stream_action_dispatch_events(
+    *,
+    actions: list[ClientAction],
+    request_id: str,
+    user_id: str,
+    action_dispatcher: Any,
+    action_results: list[dict[str, object]] | None = None,
+    all_actions: list[ClientAction] | None = None,
+    execution_context: list[str] | None = None,
+) -> Generator[bytes, None, None]:
+    result_sink = action_results if action_results is not None else []
+    action_sink = all_actions if all_actions is not None else []
+    pending_actions = list(actions)
+    while pending_actions:
+        action = pending_actions.pop(0)
+        action_index = len(action_sink) + len(result_sink) + 1
+        fallback_action_id = f"plan-step-{action_index}"
+        action_sink.append(action)
+        envelope = action_dispatcher.enqueue(
+            user_id=user_id,
+            request_id=request_id,
+            action=action,
+        )
+        action_id = envelope.action_id or fallback_action_id
+        yield sse_event(
+            "plan_step",
+            _action_plan_step_payload(
+                action,
+                action_id=action_id,
+                status="queued",
+                request_id=request_id,
+            ),
+        )
+        yield sse_event("action_dispatch", envelope.model_dump())
+        yield sse_event(
+            "plan_step",
+            _action_plan_step_payload(
+                action,
+                action_id=action_id,
+                status="in_progress",
+                request_id=request_id,
+            ),
+        )
+        action_result = action_dispatcher.wait_for_result(
+            action_id=envelope.action_id,
+            request_id=request_id,
+            timeout_seconds=action_result_timeout_seconds(action),
+        )
+        action_payload = action_result_payload(envelope, action_result, action)
+        result_sink.append(action_payload)
+        yield sse_event(
+            "plan_step",
+            _action_plan_step_payload(
+                action,
+                action_id=action_id,
+                status=_normalize_plan_step_status(action_result.status),
+                request_id=request_id,
+            ),
+        )
+        yield sse_event("action_result", action_payload)
+        record_action_context(
+            action_dispatcher=action_dispatcher,
+            user_id=user_id,
+            action=action,
+            status=action_result.status,
+            output=action_result.output,
+            action_id=envelope.action_id,
+        )
+        if execution_context is not None:
+            execution_context.append(
+                format_action_context(
+                    action=action,
+                    status=action_result.status,
+                    output=action_result.output,
+                    error=action_result.error,
+                )
+            )
+        follow_up = follow_up_action_from_result(
+            action,
+            status=action_result.status,
+            output=action_result.output,
+        )
+        if follow_up is not None:
+            pending_actions.append(follow_up)
+
+
 def dispatch_actions_sync(
     *,
     actions: list[ClientAction],
     request_id: str,
     user_id: str,
     action_dispatcher: Any,
+    execution_context: list[str] | None = None,
 ) -> tuple[list[ClientAction], list[dict[str, object]]]:
     all_actions: list[ClientAction] = []
     action_results: list[dict[str, object]] = []
@@ -199,6 +289,7 @@ def dispatch_actions_sync(
             user_id=user_id,
             request_id=request_id,
             action=action,
+            timeout_seconds=action_result_timeout_seconds(action),
         )
         action_payload = action_result_payload(envelope, action_result, action)
         action_results.append(action_payload)
@@ -208,7 +299,17 @@ def dispatch_actions_sync(
             action=action,
             status=action_result.status,
             output=action_result.output,
+            action_id=envelope.action_id,
         )
+        if execution_context is not None:
+            execution_context.append(
+                format_action_context(
+                    action=action,
+                    status=action_result.status,
+                    output=action_result.output,
+                    error=action_result.error,
+                )
+            )
         follow_up = follow_up_action_from_result(
             action,
             status=action_result.status,
@@ -219,6 +320,49 @@ def dispatch_actions_sync(
     return all_actions, action_results
 
 
+CONFIRM_LIKELY_ACTION_TYPES = {
+    "keyboard_type",
+    "hotkey",
+    "terminal",
+    "file_write",
+    "mouse_click",
+    "mouse_drag",
+}
+
+CONFIRM_LIKELY_BROWSER_COMMANDS = {"click_element", "type_element"}
+
+CONFIRM_LIKELY_CALENDAR_COMMANDS = {
+    "create_event",
+    "update_event",
+    "delete_event",
+}
+
+
+def action_result_timeout_seconds(action: ClientAction) -> float | None:
+    """Allow UI confirmation latency before marking risky actions timed out."""
+    if not _confirmation_likely(action):
+        return None
+    raw = os.getenv("JARVIS_CLIENT_ACTION_CONFIRM_TIMEOUT_SECONDS", "45")
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        return 45.0
+
+
+def _confirmation_likely(action: ClientAction) -> bool:
+    action_type = str(action.type or "")
+    command = str(action.command or "")
+    return (
+        bool(action.requires_confirm)
+        or action_type in CONFIRM_LIKELY_ACTION_TYPES
+        or (action_type == "browser_control" and command in CONFIRM_LIKELY_BROWSER_COMMANDS)
+        or (
+            action_type == "calendar_control"
+            and command in CONFIRM_LIKELY_CALENDAR_COMMANDS
+        )
+    )
+
+
 def record_action_context(
     *,
     action_dispatcher: Any,
@@ -226,6 +370,7 @@ def record_action_context(
     action: ClientAction,
     status: str,
     output: dict[str, object],
+    action_id: str | None = None,
 ) -> None:
     store = getattr(action_dispatcher, "context_store", None)
     if store is None:
@@ -235,6 +380,7 @@ def record_action_context(
         action=action,
         status=status,
         output=output,
+        action_id=action_id,
     )
 
 

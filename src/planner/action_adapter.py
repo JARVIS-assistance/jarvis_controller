@@ -100,21 +100,12 @@ class V2ToV1ActionAdapter:
                     requires_confirm=action.requires_confirm,
                     step_id=action.step_id,
                 )
-            target = _concrete_browser_target(action, context=context)
-            if target is None:
-                return _issue(
-                    "missing_browser_target",
-                    "browser.open without url requires a concrete configured browser",
-                    index,
-                    action,
-                    field="target",
-                )
             return ClientAction(
-                type="app_control",
+                type="browser",
                 command="open",
-                target=target,
-                args={},
-                description=action.description or f"Open {target}",
+                target=None,
+                args=_without_none({"browser": browser}),
+                description=action.description or "Open browser",
                 requires_confirm=action.requires_confirm,
                 step_id=action.step_id,
             )
@@ -317,21 +308,6 @@ def _search_engine_template(search_engine: str) -> str | None:
         return "https://duckduckgo.com/?q={query}"
     if normalized == "google":
         return "https://www.google.com/search?q={query}"
-    return None
-
-
-def _concrete_browser_target(
-    action: ClientActionV2,
-    *,
-    context: dict[str, Any] | None,
-) -> str | None:
-    for value in (
-        _string_arg(action.args, "browser"),
-        action.target,
-        _context_string(context, "default_browser"),
-    ):
-        if value and value not in {"browser", "default_browser", "web_browser"}:
-            return value
     return None
 
 

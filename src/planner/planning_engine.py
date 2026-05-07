@@ -64,11 +64,24 @@ def _derive_goal(lines: list[str]) -> str:
 def _extract_constraints(lines: list[str]) -> list[str]:
     constraints: list[str] = []
     for line in lines:
+        if _is_step_line(line):
+            continue
         lowered = line.lower()
         if _looks_like_constraint(line):
             constraints.append(line.rstrip("."))
             continue
-        if any(token in lowered for token in ("must ", "should ", "without ", "avoid ", "제약", "반드시", "하지 말고")):
+        if any(
+            token in lowered
+            for token in (
+                "must ",
+                "should ",
+                "without ",
+                "avoid ",
+                "제약",
+                "반드시",
+                "하지 말고",
+            )
+        ):
             constraints.append(line.rstrip("."))
     return _dedupe(constraints)
 
@@ -83,7 +96,11 @@ def _default_plan_steps(goal: str, constraints: list[str]) -> list[PlanStep]:
         PlanStep("s1", "Clarify objective", f"Confirm the target outcome for: {goal}"),
         PlanStep("s2", "Capture constraints", _constraints_description(constraints)),
         PlanStep("s3", "Sequence execution", "Break the work into ordered tasks with dependencies"),
-        PlanStep("s4", "Define validation", "Specify how success will be checked before completion"),
+        PlanStep(
+            "s4",
+            "Define validation",
+            "Specify how success will be checked before completion",
+        ),
     ]
 
 

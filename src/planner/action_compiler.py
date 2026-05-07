@@ -3,29 +3,63 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import socket
 import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
 from jarvis_contracts import (
     ClientAction,
     ClientActionPlan,
-    ClientActionV2,
     ClientActionValidationIssue,
     format_action_v2_registry_for_prompt,
-    normalize_action_payload,
 )
-from pydantic import ValidationError
 
 from planner.action_adapter import V2ToV1ActionAdapter
+from planner.action_gate import (
+    ActionIntentGate,
+    intent_gate_payload,
+    intent_gate_prompt,
+    parse_intent_gate,
+)
+from planner.action_model_client import (
+    action_compiler_model_name,
+    action_intent_model_name,
+    action_model_endpoint,
+    action_model_provider,
+    complete_model_text,
+    post_json_request,
+)
+from planner.action_plan_parser import (
+    EmbeddedActionParseResult,
+    coerce_client_actions_from_text,
+    parse_embedded_actions_from_text,
+    parse_plan,
+)
+from planner.action_templates import (
+    fast_action_templates,
+    materialize_gate_template,
+    required_action_names_for_gate,
+    template_key_for_gate,
+)
 from planner.action_validator import ActionValidator
 
 logger = logging.getLogger("jarvis_controller.action_compiler")
 
 DIRECT_EXECUTION_MODES = {"direct", "direct_sequence"}
+
+__all__ = [
+    "DIRECT_EXECUTION_MODES",
+    "ActionCompiler",
+    "ActionIntentDecision",
+    "EmbeddedActionParseResult",
+    "action_compiler_prompt_payload",
+    "classify_client_action_intent_decision",
+    "coerce_client_actions_from_text",
+    "compile_action_decision_from_model_text",
+    "parse_embedded_actions_from_text",
+    "should_try_client_action_classifier",
+]
 
 
 @dataclass(frozen=True)
@@ -38,13 +72,6 @@ class ActionIntentDecision:
     actions: list[ClientAction]
     plan: ClientActionPlan | None = None
     validation_errors: list[ClientActionValidationIssue] | None = None
-
-
-@dataclass(frozen=True)
-class EmbeddedActionParseResult:
-    saw_action_block: bool
-    actions: list[ClientAction]
-    issues: list[ClientActionValidationIssue]
 
 
 class ActionCompiler:
@@ -66,22 +93,29 @@ class ActionCompiler:
         context: dict[str, Any] | None = None,
         latest_observation: dict[str, Any] | None = None,
         validation_errors: list[ClientActionValidationIssue] | None = None,
+        intent_gate: ActionIntentGate | None = None,
     ) -> ClientActionPlan | None:
         if not message.strip():
-            return ClientActionPlan(mode="no_action", confidence=1.0, reason="empty message")
+            return ClientActionPlan(
+                mode="no_action", confidence=1.0, reason="empty message"
+            )
         if not _enabled():
             return None
 
-        endpoint = os.getenv(
-            "JARVIS_ACTION_INTENT_MODEL_ENDPOINT",
-            "https://qwen.breakpack.cc/engines/v1/chat/completions",
+        endpoint = action_model_endpoint()
+        model = action_compiler_model_name()
+        provider = action_model_provider()
+        timeout = _float_env("JARVIS_ACTION_COMPILER_MODEL_TIMEOUT_SECONDS", 20.0)
+        max_tokens = int(_float_env("JARVIS_ACTION_COMPILER_MODEL_MAX_TOKENS", 320))
+        logger.info(
+            "action plan compiler request provider=%s endpoint=%s model=%s "
+            "timeout=%.1fs message=%s",
+            provider,
+            endpoint,
+            model,
+            timeout,
+            message[:200],
         )
-        model = os.getenv(
-            "JARVIS_ACTION_INTENT_MODEL_NAME",
-            "docker.io/ai/gemma3-qat:4B",
-        )
-        timeout = _float_env("JARVIS_ACTION_INTENT_MODEL_TIMEOUT_SECONDS", 2.5)
-        max_tokens = int(_float_env("JARVIS_ACTION_INTENT_MODEL_MAX_TOKENS", 260))
 
         payload = {
             "model": model,
@@ -94,6 +128,8 @@ class ActionCompiler:
                             "message": message,
                             "runtime_context": context or {},
                             "latest_observation": latest_observation or {},
+                            "intent_gate": intent_gate_payload(intent_gate),
+                            "action_templates": fast_action_templates(),
                             "validation_errors": [
                                 issue.model_dump()
                                 for issue in (validation_errors or [])
@@ -109,16 +145,25 @@ class ActionCompiler:
         }
 
         try:
-            data = _post_json(endpoint, payload, timeout=timeout)
-            content = str(
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
+            content = complete_model_text(
+                provider=provider,
+                endpoint=endpoint,
+                model=model,
+                payload=payload,
+                timeout=timeout,
+                post_json=_post_json,
             )
-            return _parse_plan(content)
+            plan = parse_plan(content)
+            logger.info(
+                "action plan compiler response mode=%s confidence=%.2f actions=%d",
+                plan.mode,
+                plan.confidence,
+                len(plan.actions),
+            )
+            return plan
         except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
             logger.warning(
-                "action compiler failed endpoint=%s model=%s timeout=%.1fs error=%s",
+                "action plan compiler failed endpoint=%s model=%s timeout=%.1fs error=%s",
                 endpoint,
                 model,
                 timeout,
@@ -127,6 +172,85 @@ class ActionCompiler:
             return None
         except Exception as exc:
             logger.warning("action compiler failed: %s", exc)
+            return None
+
+    def compile_intent_gate(
+        self,
+        *,
+        message: str,
+        context: dict[str, Any] | None = None,
+        latest_observation: dict[str, Any] | None = None,
+    ) -> ActionIntentGate | None:
+        if not message.strip():
+            return ActionIntentGate(
+                should_act=False,
+                intent="none",
+                confidence=1.0,
+                reason="empty message",
+            )
+        if not _enabled():
+            return None
+        endpoint = action_model_endpoint()
+        model = action_intent_model_name()
+        provider = action_model_provider()
+        timeout = _float_env("JARVIS_ACTION_INTENT_MODEL_TIMEOUT_SECONDS", 2.0)
+        max_tokens = int(_float_env("JARVIS_ACTION_INTENT_MODEL_MAX_TOKENS", 192))
+        logger.info(
+            "action intent gate request provider=%s endpoint=%s model=%s timeout=%.1fs message=%s",
+            provider,
+            endpoint,
+            model,
+            timeout,
+            message[:200],
+        )
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": intent_gate_prompt()},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "message": message,
+                            "runtime_context": context or {},
+                            "latest_observation": latest_observation or {},
+                        },
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "stream": False,
+            "temperature": 0,
+            "max_tokens": max_tokens,
+        }
+        try:
+            content = complete_model_text(
+                provider=provider,
+                endpoint=endpoint,
+                model=model,
+                payload=payload,
+                timeout=timeout,
+                post_json=_post_json,
+            )
+            gate = parse_intent_gate(content)
+            logger.info(
+                "action intent gate response should_act=%s intent=%s confidence=%.2f",
+                gate.should_act,
+                gate.intent,
+                gate.confidence,
+            )
+            return gate
+        except (TimeoutError, socket.timeout, urllib.error.URLError) as exc:
+            logger.warning(
+                "action intent gate failed endpoint=%s model=%s timeout=%.1fs error=%s",
+                endpoint,
+                model,
+                timeout,
+                exc,
+            )
+            return None
+        except Exception as exc:
+            logger.warning("action intent gate failed: %s", exc)
             return None
 
     def compile_decision(
@@ -138,38 +262,265 @@ class ActionCompiler:
         validation_errors: list[ClientActionValidationIssue] | None = None,
         max_retries: int = 1,
     ) -> ActionIntentDecision | None:
+        gate = self.compile_intent_gate(
+            message=message,
+            context=context,
+            latest_observation=latest_observation,
+        )
+        if (
+            gate is not None
+            and not gate.should_act
+            and gate.confidence >= _action_intent_confidence_threshold()
+        ):
+            return ActionIntentDecision(
+                should_act=False,
+                execution_mode="no_action",
+                intent=gate.intent or "none",
+                confidence=gate.confidence,
+                reason=gate.reason,
+                actions=[],
+                plan=None,
+                validation_errors=[],
+            )
+        if gate is None:
+            logger.warning(
+                "action intent gate unavailable; trying plan compiler fallback message=%s",
+                message[:200],
+            )
+        elif not gate.should_act:
+            logger.info(
+                "action intent gate confidence below threshold; trying plan compiler "
+                "fallback confidence=%.2f threshold=%.2f message=%s",
+                gate.confidence,
+                _action_intent_confidence_threshold(),
+                message[:200],
+            )
+
         plan = self.compile_plan(
             message=message,
             context=context,
             latest_observation=latest_observation,
             validation_errors=validation_errors,
+            intent_gate=gate,
         )
         if plan is None:
             return None
 
-        decision = self._decision_from_plan(plan, context=context)
-        retries_left = max_retries
-        while (
-            decision is not None
-            and decision.validation_errors
-            and retries_left > 0
+        if (
+            gate is not None
+            and gate.should_act
+            and plan.mode == "no_action"
+            and gate.confidence >= _action_intent_confidence_threshold()
+            and max_retries > 0
         ):
+            if _has_working_context_followup_state(context):
+                reused_text_error = _gate_template_reuses_working_text_issue(
+                    gate,
+                    context,
+                )
+                if reused_text_error is not None:
+                    return ActionIntentDecision(
+                        should_act=False,
+                        execution_mode="invalid",
+                        intent=gate.intent or "action",
+                        confidence=gate.confidence,
+                        reason="contextual follow-up text was not transformed",
+                        actions=[],
+                        plan=plan,
+                        validation_errors=[reused_text_error],
+                    )
+                template_decision = self._decision_from_gate_template(
+                    gate,
+                    context=context,
+                )
+                if template_decision is not None and template_decision.should_act:
+                    return template_decision
+
+            retry_errors = [
+                _issue(
+                    "intent_gate_contradiction",
+                    "Intent gate classified this request as actionable; "
+                    "compile an action plan instead of no_action.",
+                    field="mode",
+                    details=intent_gate_payload(gate),
+                )
+            ]
+            plan = self.compile_plan(
+                message=message,
+                context=context,
+                latest_observation=latest_observation,
+                validation_errors=retry_errors,
+                intent_gate=gate,
+            )
+            if plan is None:
+                return None
+            max_retries -= 1
+
+        if (
+            gate is None
+            and plan.mode == "no_action"
+            and max_retries > 0
+            and _has_working_context_followup_state(context)
+        ):
+            retry_errors = [
+                _issue(
+                    "working_context_followup_check",
+                    "Short-term working context is available. Re-check whether "
+                    "the user message is a follow-up operation on the previous "
+                    "app/browser/typed content. If it is only ordinary chat, "
+                    "recommendation, advice, or explanation, keep no_action.",
+                    field="runtime_context.working_context",
+                    details=_working_context_retry_details(context),
+                )
+            ]
+            plan = self.compile_plan(
+                message=message,
+                context=context,
+                latest_observation=latest_observation,
+                validation_errors=retry_errors,
+                intent_gate=gate,
+            )
+            if plan is None:
+                return None
+            max_retries -= 1
+
+        if (
+            gate is not None
+            and gate.should_act
+            and plan.mode == "no_action"
+            and gate.confidence >= _action_intent_confidence_threshold()
+        ):
+            reused_text_error = _gate_template_reuses_working_text_issue(
+                gate,
+                context,
+            )
+            if reused_text_error is not None:
+                repair_plan = self.compile_plan(
+                    message=message,
+                    context=context,
+                    latest_observation=latest_observation,
+                    validation_errors=[reused_text_error],
+                    intent_gate=gate,
+                )
+                if repair_plan is None:
+                    return None
+                plan_reuse_error = _plan_reuses_working_text_issue(
+                    repair_plan,
+                    context,
+                )
+                if plan_reuse_error is not None or repair_plan.mode == "no_action":
+                    return ActionIntentDecision(
+                        should_act=False,
+                        execution_mode="invalid",
+                        intent=gate.intent or "action",
+                        confidence=gate.confidence,
+                        reason="contextual follow-up text was not transformed",
+                        actions=[],
+                        plan=repair_plan,
+                        validation_errors=[plan_reuse_error or reused_text_error],
+                    )
+                plan = repair_plan
+            else:
+                template_decision = self._decision_from_gate_template(
+                    gate,
+                    context=context,
+                )
+                if template_decision is not None:
+                    return template_decision
+
+        template_completeness_error = _intent_template_completeness_issue(gate, plan)
+        if template_completeness_error is not None and max_retries > 0:
+            plan = self.compile_plan(
+                message=message,
+                context=context,
+                latest_observation=latest_observation,
+                validation_errors=[template_completeness_error],
+                intent_gate=gate,
+            )
+            if plan is None:
+                return None
+            max_retries -= 1
+            if (
+                gate is not None
+                and gate.should_act
+                and plan.mode == "no_action"
+                and gate.confidence >= _action_intent_confidence_threshold()
+            ):
+                template_decision = self._decision_from_gate_template(
+                    gate,
+                    context=context,
+                )
+                if template_decision is not None:
+                    return template_decision
+            template_completeness_error = _intent_template_completeness_issue(gate, plan)
+
+        if (
+            template_completeness_error is not None
+            and gate is not None
+            and gate.should_act
+            and gate.confidence >= _action_intent_confidence_threshold()
+        ):
+            template_decision = self._decision_from_gate_template(
+                gate,
+                context=context,
+            )
+            if template_decision is not None:
+                return template_decision
+
+        decision = self._decision_from_plan(plan, message=message, context=context)
+        retries_left = max_retries
+        while decision is not None and decision.validation_errors and retries_left > 0:
             retry_plan = self.compile_plan(
                 message=message,
                 context=context,
                 latest_observation=latest_observation,
                 validation_errors=decision.validation_errors,
+                intent_gate=gate,
             )
             if retry_plan is None:
                 break
-            decision = self._decision_from_plan(retry_plan, context=context)
+            decision = self._decision_from_plan(
+                retry_plan,
+                message=message,
+                context=context,
+            )
             retries_left -= 1
         return decision
+
+    def _decision_from_gate_template(
+        self,
+        gate: ActionIntentGate,
+        *,
+        context: dict[str, Any] | None,
+    ) -> ActionIntentDecision | None:
+        materialized = materialize_gate_template(gate, context=context)
+        plan = materialized.plan
+        issues = materialized.issues
+        if isinstance(plan, ClientActionPlan):
+            logger.info(
+                "action compiler using intent template fallback template=%s intent=%s",
+                template_key_for_gate(gate),
+                gate.intent,
+            )
+            return self._decision_from_plan(plan, message="", context=context)
+        if issues:
+            return ActionIntentDecision(
+                should_act=False,
+                execution_mode="invalid",
+                intent=gate.intent or "action",
+                confidence=gate.confidence,
+                reason="intent template fallback could not be materialized",
+                actions=[],
+                plan=None,
+                validation_errors=issues,
+            )
+        return None
 
     def _decision_from_plan(
         self,
         plan: ClientActionPlan,
         *,
+        message: str = "",
         context: dict[str, Any] | None,
     ) -> ActionIntentDecision:
         if plan.mode == "no_action":
@@ -188,7 +539,9 @@ class ActionCompiler:
         if adapted.valid:
             execution_mode = plan.mode
             if execution_mode not in {"direct", "direct_sequence", "needs_plan"}:
-                execution_mode = "direct_sequence" if len(adapted.actions) > 1 else "direct"
+                execution_mode = (
+                    "direct_sequence" if len(adapted.actions) > 1 else "direct"
+                )
             return ActionIntentDecision(
                 should_act=bool(adapted.actions),
                 execution_mode=execution_mode,
@@ -233,11 +586,15 @@ def compile_action_decision_from_model_text(
     context: dict[str, Any] | None = None,
 ) -> ActionIntentDecision | None:
     try:
-        plan = _parse_plan(content)
+        plan = parse_plan(content)
     except Exception as exc:
         logger.warning("action compiler fallback response parse failed: %s", exc)
         return None
-    return ActionCompiler()._decision_from_plan(plan, context=context)
+    return ActionCompiler()._decision_from_plan(plan, message="", context=context)
+
+
+_parse_intent_gate = parse_intent_gate
+_intent_gate_payload = intent_gate_payload
 
 
 def action_compiler_prompt_payload(
@@ -253,9 +610,9 @@ def action_compiler_prompt_payload(
             {
                 "message": message,
                 "runtime_context": context or {},
+                "action_templates": fast_action_templates(),
                 "validation_errors": [
-                    issue.model_dump()
-                    for issue in (validation_errors or [])
+                    issue.model_dump() for issue in (validation_errors or [])
                 ],
             },
             ensure_ascii=False,
@@ -268,375 +625,12 @@ def should_try_client_action_classifier(message: str) -> bool:
     return bool(message.strip())
 
 
-def parse_embedded_actions_from_text(
-    content: str,
-    *,
-    context: dict[str, Any] | None = None,
-) -> EmbeddedActionParseResult:
-    saw_action_block = False
-    actions: list[ClientAction] = []
-    issues: list[ClientActionValidationIssue] = []
-    validator = ActionValidator()
-    adapter = V2ToV1ActionAdapter(validator=validator)
-
-    for raw in _action_block_payloads(content):
-        saw_action_block = True
-        items = raw if isinstance(raw, list) else [raw]
-        for index, item in enumerate(items):
-            if not isinstance(item, dict):
-                issues.append(
-                    _issue(
-                        "invalid_embedded_action",
-                        "Embedded action item is not an object",
-                        action_index=index,
-                    )
-                )
-                continue
-            if "name" in item or "actions" in item or "mode" in item:
-                plan = _embedded_v2_plan(item)
-                if plan is None:
-                    issues.append(
-                        _issue(
-                            "invalid_v2_action_block",
-                            "Embedded v2 action block is not a valid ClientActionPlan",
-                            action_index=index,
-                        )
-                    )
-                    continue
-                adapted = adapter.adapt_plan(plan, context=context)
-                if adapted.valid:
-                    actions.extend(adapted.actions)
-                else:
-                    issues.extend(adapted.issues)
-                continue
-
-            recovered_plan = _embedded_legacy_v1_plan(item)
-            if recovered_plan is not None:
-                adapted = adapter.adapt_plan(recovered_plan, context=context)
-                if adapted.valid:
-                    actions.extend(adapted.actions)
-                    continue
-                issues.extend(adapted.issues)
-                continue
-
-            try:
-                action = ClientAction.model_validate(normalize_action_payload(item))
-            except ValidationError as exc:
-                issues.append(
-                    _issue(
-                        "invalid_v1_action_block",
-                        "Embedded v1 action block is not a valid ClientAction",
-                        action_index=index,
-                        details={"errors": exc.errors()},
-                    )
-                )
-                continue
-            validation = validator.validate_v1_actions([action], context=context)
-            if validation.valid:
-                actions.extend(validation.actions)
-            else:
-                issues.extend(validation.issues)
-
-    return EmbeddedActionParseResult(saw_action_block, actions, issues)
+_fast_action_templates = fast_action_templates
+_materialize_gate_template = materialize_gate_template
+_template_key_for_gate = template_key_for_gate
 
 
-def coerce_client_actions_from_text(
-    content: str,
-    *,
-    context: dict[str, Any] | None = None,
-    message: str | None = None,
-) -> list[ClientAction]:
-    _ = message
-    return parse_embedded_actions_from_text(content, context=context).actions
-
-
-def _embedded_v2_plan(item: dict[str, Any]) -> ClientActionPlan | None:
-    try:
-        if "actions" in item or "mode" in item:
-            return ClientActionPlan.model_validate(item)
-        return ClientActionPlan(
-            mode="direct",
-            confidence=0.8,
-            reason="embedded v2 action",
-            actions=[ClientActionV2.model_validate(item)],
-        )
-    except ValidationError:
-        return None
-
-
-def _embedded_legacy_v1_plan(item: dict[str, Any]) -> ClientActionPlan | None:
-    try:
-        return ClientActionPlan(
-            mode="direct",
-            confidence=0.75,
-            reason="embedded legacy v1 action",
-            actions=[ClientActionV2.model_validate(_legacy_action_payload_to_v2(item))],
-        )
-    except ValidationError:
-        return None
-
-
-def _action_block_payloads(content: str) -> list[Any]:
-    payloads: list[Any] = []
-    pattern = r"```(?:actions|json)\s*\n(.*?)```"
-    for match in re.findall(pattern, content, re.DOTALL | re.IGNORECASE):
-        try:
-            payloads.append(json.loads(match.strip()))
-        except json.JSONDecodeError:
-            continue
-    return payloads
-
-
-def _parse_plan(content: str) -> ClientActionPlan:
-    text = content.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json|actions)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    if not text.lstrip().startswith("["):
-        start = text.find("{")
-        end = text.rfind("}")
-        if start >= 0 and end > start:
-            text = text[start : end + 1]
-    parsed = json.loads(text)
-    if isinstance(parsed, list):
-        return ClientActionPlan(
-            mode="direct_sequence" if len(parsed) > 1 else "direct",
-            confidence=0.8,
-            reason="action array response",
-            actions=[ClientActionV2.model_validate(item) for item in parsed],
-        )
-    if not isinstance(parsed, dict):
-        raise ValueError("compiler response is not a JSON object")
-    if "should_act" in parsed and "mode" not in parsed:
-        parsed = _legacy_plan_payload(parsed)
-    return ClientActionPlan.model_validate(parsed)
-
-
-def _legacy_plan_payload(parsed: dict[str, Any]) -> dict[str, Any]:
-    if not parsed.get("should_act"):
-        return {
-            "mode": "no_action",
-            "goal": None,
-            "actions": [],
-            "confidence": float(parsed.get("confidence") or 0),
-            "reason": parsed.get("reason"),
-        }
-    return {
-        "mode": parsed.get("execution_mode") or "direct",
-        "goal": parsed.get("intent"),
-        "actions": [
-            _legacy_action_payload_to_v2(item)
-            for item in (
-                parsed.get("actions")
-                or ([] if parsed.get("action") is None else [parsed["action"]])
-            )
-            if isinstance(item, dict)
-        ],
-        "confidence": float(parsed.get("confidence") or 0),
-        "reason": parsed.get("reason"),
-    }
-
-
-def _legacy_action_payload_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
-    if "name" in payload:
-        return payload
-
-    data = normalize_action_payload(payload)
-    action_type = data.get("type")
-    command = data.get("command")
-    args = data.get("args") if isinstance(data.get("args"), dict) else {}
-    target = data.get("target") if isinstance(data.get("target"), str) else None
-    payload_text = data.get("payload") if isinstance(data.get("payload"), str) else None
-    description = (
-        data.get("description")
-        if isinstance(data.get("description"), str)
-        else "Client action"
-    )
-    requires_confirm = bool(data.get("requires_confirm", False))
-
-    if action_type == "open_url":
-        query = args.get("query")
-        if isinstance(query, str) and query.strip():
-            return {
-                "name": "browser.search",
-                "args": {
-                    key: value
-                    for key, value in {
-                        "query": query.strip(),
-                        "browser": args.get("browser"),
-                        "search_engine": args.get("search_engine") or args.get("engine"),
-                    }.items()
-                    if value is not None
-                },
-                "description": description,
-                "requires_confirm": requires_confirm,
-            }
-        return {
-            "name": "browser.navigate",
-            "args": {
-                key: value
-                for key, value in {
-                    "url": target or payload_text,
-                    "browser": args.get("browser"),
-                }.items()
-                if value is not None
-            },
-            "description": description,
-            "requires_confirm": requires_confirm,
-        }
-
-    if action_type == "browser_control":
-        if command == "search":
-            return {
-                "name": "browser.search",
-                "args": {
-                    key: value
-                    for key, value in {
-                        "query": args.get("query") or payload_text,
-                        "browser": args.get("browser"),
-                        "search_engine": args.get("search_engine") or args.get("engine"),
-                    }.items()
-                    if value is not None
-                },
-                "description": description,
-                "requires_confirm": requires_confirm,
-            }
-        if command in {"open", "open_url", "navigate"}:
-            return {
-                "name": "browser.navigate",
-                "args": {
-                    key: value
-                    for key, value in {
-                        "url": target or payload_text,
-                        "browser": args.get("browser"),
-                    }.items()
-                    if value is not None
-                },
-                "description": description,
-                "requires_confirm": requires_confirm,
-            }
-        if command == "extract_dom":
-            return {
-                "name": "browser.extract_dom",
-                "target": target,
-                "args": args,
-                "description": description,
-                "requires_confirm": requires_confirm,
-            }
-        if command == "click_element":
-            return {
-                "name": "browser.click",
-                "target": target,
-                "args": {"ai_id": args.get("ai_id")},
-                "description": description,
-                "requires_confirm": requires_confirm,
-            }
-        if command == "type_element":
-            return {
-                "name": "browser.type",
-                "target": target,
-                "payload": payload_text,
-                "args": {
-                    "ai_id": args.get("ai_id"),
-                    "text": args.get("text") or payload_text,
-                    "enter": bool(args.get("enter", False)),
-                },
-                "description": description,
-                "requires_confirm": requires_confirm,
-            }
-        if command == "select_result":
-            return {
-                "name": "browser.select_result",
-                "target": target,
-                "args": {
-                    "index": _coerce_result_index(
-                        args.get("index") or target or payload_text
-                    )
-                },
-                "description": description,
-                "requires_confirm": requires_confirm,
-            }
-
-    if action_type == "web_search":
-        query = args.get("query") or args.get("search_query") or target or payload_text
-        return {
-            "name": "browser.search",
-            "args": {
-                key: value
-                for key, value in {
-                    "query": query,
-                    "browser": args.get("browser"),
-                    "search_engine": args.get("search_engine") or args.get("engine"),
-                }.items()
-                if value is not None
-            },
-            "description": description,
-            "requires_confirm": requires_confirm,
-        }
-
-    if action_type in {"web_click", "web_select", "select_result"}:
-        return {
-            "name": "browser.select_result",
-            "target": "active_tab",
-            "args": {
-                "index": _coerce_result_index(
-                    args.get("index") or target or payload_text
-                )
-            },
-            "description": description,
-            "requires_confirm": requires_confirm,
-        }
-
-    if action_type == "app_control":
-        query = args.get("query") or args.get("search_query")
-        target_value = (target or "").strip().lower()
-        if (
-            target_value in {"browser", "default_browser", "web_browser"}
-            and isinstance(query, str)
-            and query.strip()
-        ):
-            return {
-                "name": "browser.search",
-                "args": {
-                    key: value
-                    for key, value in {
-                        "query": query.strip(),
-                        "browser": args.get("browser"),
-                        "search_engine": args.get("search_engine") or args.get("engine"),
-                    }.items()
-                    if value is not None
-                },
-                "description": description,
-                "requires_confirm": requires_confirm,
-            }
-        return {
-            "name": "app.focus" if command == "focus" else "app.open",
-            "target": target,
-            "args": args,
-            "description": description,
-            "requires_confirm": requires_confirm,
-        }
-
-    if action_type == "keyboard_type":
-        return {
-            "name": "keyboard.type",
-            "target": target,
-            "payload": payload_text,
-            "args": {"text": payload_text, "enter": bool(args.get("enter", False))},
-            "description": description,
-            "requires_confirm": requires_confirm,
-        }
-
-    if action_type == "hotkey":
-        return {
-            "name": "keyboard.hotkey",
-            "target": target,
-            "args": {"keys": args.get("keys")},
-            "description": description,
-            "requires_confirm": requires_confirm,
-        }
-
-    return payload
+_parse_plan = parse_plan
 
 
 def _system_prompt() -> str:
@@ -648,18 +642,79 @@ Compile the user message into an ActionContract v2 ClientActionPlan.
 Do not answer the user. Do not emit v1 action types.
 If the request is ordinary conversation or information-only, return mode "no_action".
 If validation_errors are provided, fix the structured plan according to those errors.
+If input intent_gate.should_act is true, treat the request as actionable and do not
+return no_action unless the requested operation is impossible under the registry or
+disabled runtime capabilities.
 
 Rules:
 - Use only capability names from the registry.
+- Return no_action for greetings, thanks, casual chat, or information-only requests.
+- A request is actionable only when the user asks JARVIS to operate the local computer,
+  browser, application, shell, keyboard, mouse, files, clipboard, or screen.
+- runtime_context.working_context is short-term action session state. Use it to
+  resolve follow-up requests that refer to the immediately previous app, browser,
+  typed text, or visible action result.
+- Recommendation, advice, explanation, summary, brainstorming, or menu suggestions are
+  answer-generation requests. Return no_action unless the user explicitly asks to
+  search the web, open a browser, click, type, or use another local computer action.
 - Use app.open/app.focus only for concrete local applications.
+- When runtime_context.available_applications is present, app targets must use an
+  exact listed application name. Aliases are hints only; never emit aliases as targets.
 - Never use target "browser", "default_browser", or "web_browser" for app actions.
 - Use browser.open/browser.navigate/browser.search for browser work.
 - Use browser.extract_dom before browser.click/browser.type when the element id is unknown.
 - Use browser.select_result only when the user asks to open a numbered result
   already visible in current search results.
+- If the user asks to search for something and "go in/open it" without specifying
+  a numbered result, use direct_sequence: browser.search then browser.select_result
+  with args.index=1.
+- Do not simplify multi-operation requests. Preserve every distinct requested
+  operation as ordered action steps.
+- If input intent_gate.template_key is app_open_type, return app.open followed by
+  keyboard.type. If intent_gate.slots.text is present, type that concrete text.
+  If the user asks to write/create/compose generated content in the app, generate
+  the final content and place that concrete final text in keyboard.type args.text.
+- For contextual writing follow-ups, use runtime_context.working_context.active_app
+  as the app target and working_context.last_typed_text as the source content.
+  Translate, rewrite, continue, shorten, or otherwise transform that source only
+  when the user asks for that follow-up operation. If the user does not clearly ask
+  to replace existing content, append/type the new text without select-all.
+- If the user clearly asks to replace existing content, the plan may press
+  keyboard.hotkey with keys "command,a" on macOS or "ctrl,a" otherwise before
+  keyboard.type.
+- If validation_errors contains code intent_template_incomplete, include every
+  missing action named in details.missing_actions while preserving the expected
+  order in details.expected_actions.
 - terminal.run and calendar create/update/delete require requires_confirm=true.
 - Disabled or unavailable capabilities in runtime_context must not be used.
 - Do not invent missing URLs. If only a query is known, use browser.search with args.query.
+- Prefer an action_templates entry when it fits the request. Replace placeholders
+  such as <query>, <text>, and <exact app name>; do not return placeholders.
+
+Korean action examples:
+- "점심 메뉴 추천해줘" => mode no_action, actions [].
+- "점심 메뉴 추천해줘. 브라우저에서 검색해줘" => mode direct,
+  action browser.search, args {{"query":"점심 메뉴 추천"}}.
+- "브라우저 열어줘" => mode direct, action browser.open, args {{}}.
+- "브라우저에서 연어장 레시피 검색해줘" => mode direct, action browser.search,
+  args {{"query":"연어장 레시피"}}.
+- "네이버 웹툰 검색해서 들어가줘" => mode direct_sequence,
+  actions browser.search args {{"query":"네이버 웹툰"}}, then browser.select_result
+  args {{"index":1}}.
+- "Sublime Text 열어서 안녕하세요 작성해줘" => mode direct_sequence,
+  actions app.open target "Sublime Text", then keyboard.type args {{"text":"안녕하세요"}}.
+- "텍스트 편집기 열어서 너의 소개 작성해줘" => mode direct_sequence,
+  actions app.open target exact listed app name, then keyboard.type with generated
+  final introduction text in args.text.
+- Given runtime_context.working_context.active_app "Sublime Text" and
+  last_typed_text "안녕하세요. 저는 JARVIS입니다.", "영어로 작성해봐" =>
+  mode direct_sequence, actions app.open or app.focus target "Sublime Text",
+  then keyboard.type with the English rewritten final text.
+- "현재화면 캡쳐해서 사진으로 띄워줘" => mode direct, action screen.screenshot,
+  args {{}}.
+
+Fast JSON templates:
+{json.dumps(fast_action_templates(), ensure_ascii=False)}
 
 Capability registry:
 {registry}
@@ -684,47 +739,11 @@ JSON schema:
 """
 
 
-def _coerce_result_index(value: Any) -> int | None:
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    if not isinstance(value, str):
-        return None
-    text = value.strip().lower()
-    if text.isdigit():
-        return int(text)
-    match = re.search(r"(?:search[_\-\s]*result[_\-\s]*)?(\d+)", text)
-    if match:
-        return int(match.group(1))
-    return None
-
-
-def _without_none_v2(values: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in values.items() if value is not None}
+_intent_gate_prompt = intent_gate_prompt
 
 
 def _post_json(url: str, payload: dict[str, Any], *, timeout: float) -> dict[str, Any]:
-    body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        url=url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "JARVIS/1.0",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
-            raw = response.read().decode("utf-8")
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-        raise RuntimeError(
-            f"HTTP {exc.code} from action compiler: {error_body[:500]}"
-        ) from exc
+    return post_json_request(url, payload, timeout=timeout)
 
 
 def _intent_from_plan(plan: ClientActionPlan) -> str | None:
@@ -732,6 +751,225 @@ def _intent_from_plan(plan: ClientActionPlan) -> str | None:
         return "none" if plan.mode == "no_action" else None
     namespaces = {action.name.split(".", 1)[0] for action in plan.actions}
     return next(iter(namespaces)) if len(namespaces) == 1 else "multi_action"
+
+
+def _intent_template_completeness_issue(
+    gate: ActionIntentGate | None,
+    plan: ClientActionPlan,
+) -> ClientActionValidationIssue | None:
+    if (
+        gate is None
+        or not gate.should_act
+        or gate.confidence < _action_intent_confidence_threshold()
+        or plan.mode == "no_action"
+    ):
+        return None
+    expected = required_action_names_for_gate(gate)
+    if len(expected) < 2:
+        return None
+    actual = tuple(action.name for action in plan.actions)
+    missing = _missing_ordered_action_names(expected, actual)
+    if not missing:
+        return None
+    return _issue(
+        "intent_template_incomplete",
+        "Intent gate selected a multi-step action template, but the compiled "
+        "plan omitted one or more required action steps.",
+        action_index=_first_missing_action_index(expected, actual),
+        action_name=missing[0],
+        field="actions",
+        details={
+            "template_key": template_key_for_gate(gate),
+            "intent_gate": intent_gate_payload(gate),
+            "expected_actions": list(expected),
+            "actual_actions": list(actual),
+            "missing_actions": list(missing),
+        },
+    )
+
+
+def _has_working_context_followup_state(context: dict[str, Any] | None) -> bool:
+    working_context = (context or {}).get("working_context")
+    if not isinstance(working_context, dict):
+        return False
+    active_app = working_context.get("active_app")
+    active_browser = working_context.get("active_browser")
+    last_typed_text = working_context.get("last_typed_text")
+    recent_actions = working_context.get("recent_actions")
+    last_typed_target = working_context.get("last_typed_target")
+    last_user_visible_output = working_context.get("last_user_visible_output")
+    has_active_surface = (
+        isinstance(active_app, str)
+        and bool(active_app.strip())
+        or isinstance(active_browser, str)
+        and bool(active_browser.strip())
+    )
+    has_recent_context = (
+        isinstance(last_typed_text, str)
+        and bool(last_typed_text.strip())
+        or isinstance(last_typed_target, str)
+        and bool(last_typed_target.strip())
+        or isinstance(last_user_visible_output, str)
+        and bool(last_user_visible_output.strip())
+        or isinstance(recent_actions, list)
+        and bool(recent_actions)
+    )
+    return has_active_surface and has_recent_context
+
+
+def _working_context_retry_details(
+    context: dict[str, Any] | None,
+) -> dict[str, Any]:
+    working_context = (context or {}).get("working_context")
+    if not isinstance(working_context, dict):
+        return {}
+    details: dict[str, Any] = {}
+    for key in (
+        "active_surface",
+        "active_app",
+        "active_browser",
+        "last_typed_target",
+        "last_user_visible_output",
+    ):
+        value = working_context.get(key)
+        if isinstance(value, str) and value.strip():
+            details[key] = value.strip()
+    last_typed_text = working_context.get("last_typed_text")
+    if isinstance(last_typed_text, str) and last_typed_text.strip():
+        details["last_typed_text_available"] = True
+        details["last_typed_text_chars"] = len(last_typed_text)
+    recent_actions = working_context.get("recent_actions")
+    if isinstance(recent_actions, list):
+        details["recent_action_count"] = len(recent_actions)
+    return details
+
+
+def _missing_ordered_action_names(
+    expected: tuple[str, ...],
+    actual: tuple[str, ...],
+) -> tuple[str, ...]:
+    missing: list[str] = []
+    cursor = 0
+    for expected_name in expected:
+        try:
+            match_index = actual.index(expected_name, cursor)
+        except ValueError:
+            missing.append(expected_name)
+            continue
+        cursor = match_index + 1
+    return tuple(missing)
+
+
+def _first_missing_action_index(
+    expected: tuple[str, ...],
+    actual: tuple[str, ...],
+) -> int | None:
+    cursor = 0
+    for expected_index, expected_name in enumerate(expected):
+        try:
+            match_index = actual.index(expected_name, cursor)
+        except ValueError:
+            return min(expected_index, len(actual))
+        cursor = match_index + 1
+    return None
+
+
+def _gate_template_reuses_working_text_issue(
+    gate: ActionIntentGate,
+    context: dict[str, Any] | None,
+) -> ClientActionValidationIssue | None:
+    if not gate.should_act:
+        return None
+    template_key = template_key_for_gate(gate)
+    if template_key != "app_open_type":
+        return None
+    source_text = _working_context_last_typed_text(context)
+    if source_text is None:
+        return None
+    slots = gate.slots or {}
+    text = slots.get("text")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    if _normalized_context_text(text) != _normalized_context_text(source_text):
+        return None
+    return _issue(
+        "working_context_text_reused",
+        "The generated text for a contextual follow-up is identical to the previous typed text. "
+        "Generate the requested transformed or continued final text instead of copying the source, "
+        "unless the user explicitly requested an exact repeat.",
+        field="slots.text",
+        details={
+            "template_key": template_key,
+            "active_app": _working_context_string(context, "active_app"),
+            "last_typed_text_available": True,
+            "last_typed_text_chars": len(source_text),
+        },
+    )
+
+
+def _plan_reuses_working_text_issue(
+    plan: ClientActionPlan,
+    context: dict[str, Any] | None,
+) -> ClientActionValidationIssue | None:
+    source_text = _working_context_last_typed_text(context)
+    if source_text is None or plan.mode == "no_action":
+        return None
+    normalized_source = _normalized_context_text(source_text)
+    for index, action in enumerate(plan.actions):
+        if action.name != "keyboard.type":
+            continue
+        text = action.args.get("text")
+        if not isinstance(text, str) or not text.strip():
+            text = action.payload
+        if not isinstance(text, str) or not text.strip():
+            continue
+        if _normalized_context_text(text) == normalized_source:
+            return _issue(
+                "working_context_text_reused",
+                "The compiled keyboard.type text is identical to the previous typed text. "
+                "Generate the requested transformed or continued final text instead of copying the source, "
+                "unless the user explicitly requested an exact repeat.",
+                action_index=index,
+                action_name=action.name,
+                field="actions.args.text",
+                details={
+                    "last_typed_text_available": True,
+                    "last_typed_text_chars": len(source_text),
+                    "actual_text_chars": len(text),
+                },
+            )
+    return None
+
+
+def _working_context_last_typed_text(
+    context: dict[str, Any] | None,
+) -> str | None:
+    working_context = (context or {}).get("working_context")
+    if not isinstance(working_context, dict):
+        return None
+    text = working_context.get("last_typed_text")
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    return text if text else None
+
+
+def _working_context_string(
+    context: dict[str, Any] | None,
+    key: str,
+) -> str | None:
+    working_context = (context or {}).get("working_context")
+    if not isinstance(working_context, dict):
+        return None
+    value = working_context.get(key)
+    if isinstance(value, str):
+        value = value.strip()
+        return value if value else None
+    return None
+
+
+def _normalized_context_text(value: str) -> str:
+    return " ".join(value.split()).strip().casefold()
 
 
 def _enabled() -> bool:
@@ -744,6 +982,16 @@ def _float_env(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def _action_intent_confidence_threshold() -> float:
+    return max(
+        0.0,
+        min(
+            1.0,
+            _float_env("JARVIS_ACTION_INTENT_CONFIDENCE_THRESHOLD", 0.72),
+        ),
+    )
 
 
 def _issue(

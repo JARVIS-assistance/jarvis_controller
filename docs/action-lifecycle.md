@@ -13,7 +13,7 @@
 3. Controller가 비어있지 않은 메시지를 ActionCompiler model에 보내 `ClientActionPlan` v2를 받는다. 자연어를 keyword/regex/fallback 코드로 해석하지 않는다. 기본 classifier timeout은 `JARVIS_ACTION_INTENT_MODEL_TIMEOUT_SECONDS=6.0`이고, 모델은 `JARVIS_ACTION_INTENT_MODEL_NAME` / `JARVIS_ACTION_INTENT_MODEL` 계열 설정을 계속 사용한다.
 4. realtime stream이 먼저 `assistant_done`에 도달하더라도 Controller는 `JARVIS_ACTION_INTENT_DONE_GRACE_SECONDS`(기본 6.25초) 동안 action intent 결과를 기다릴 수 있다. 빠른 응답성 검증에서는 이 값을 낮춰야 한다.
 5. Controller가 `ActionValidator`로 v2 plan의 capability, args, policy, confirmation requirement를 검증한다. invalid output은 validation errors와 함께 compiler retry를 한 번 수행한다.
-6. valid `direct` 또는 `direct_sequence`이면 Controller는 SSE `action_intent` 다음에 `assistant_delta`로 `요청하신 작업 시작할게요`를 먼저 보내고, v2-to-v1 adapter가 기존 `ClientAction`으로 변환한 뒤 action queue에 `ClientActionEnvelope`를 넣는다.
+6. valid `direct` 또는 `direct_sequence`이면 Controller는 core의 일반 realtime 답변을 중단하고 `assistant_delta`로 `잠시만요!`, SSE `action_intent`, `assistant_delta`로 `요청하신 작업 시작할게요`를 보낸 뒤, v2-to-v1 adapter가 기존 `ClientAction`으로 변환한 action을 queue에 넣는다.
 7. Controller는 SSE `action_dispatch`로 UI에 액션 발생을 알린다.
 8. Frontend action poller가 `GET /client/actions/pending`으로 pending action을 가져온다.
 9. Frontend가 로컬 PC/브라우저에서 액션을 실행한다.
