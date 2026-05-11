@@ -32,6 +32,45 @@ def test_action_context_records_active_app_after_app_open() -> None:
     assert context["active_surface"] == "app"
     assert context["active_app"] == "Sublime Text"
     assert context["recent_actions"][0]["action_id"] == "act_app"
+    latest_result = context["latest_result"]
+    assert latest_result["app"] == "Sublime Text"
+    assert latest_result["active_app"] == "Sublime Text"
+    assert latest_result["launched_app"] == "Sublime Text"
+
+
+def test_action_context_preserves_app_result_working_metadata() -> None:
+    store = ActionContextStore()
+
+    store.record_action_result(
+        user_id="u1",
+        action=ClientAction(
+            type="app_control",
+            command="open",
+            target="Weather",
+            args={},
+            description="Open Weather",
+            requires_confirm=False,
+        ),
+        status="completed",
+        output={
+            "app": "Weather",
+            "command": "open",
+            "active_app": "Weather",
+            "launched_app": "Weather",
+            "bundle_id": "com.apple.weather",
+            "source": "app_control",
+        },
+        action_id="act_weather",
+    )
+
+    context = store.working_context("u1")
+    assert context is not None
+    assert context["active_app"] == "Weather"
+    latest_result = context["latest_result"]
+    assert latest_result["active_app"] == "Weather"
+    assert latest_result["launched_app"] == "Weather"
+    assert latest_result["bundle_id"] == "com.apple.weather"
+    assert latest_result["source"] == "app_control"
 
 
 def test_action_context_records_keyboard_type_against_active_app() -> None:

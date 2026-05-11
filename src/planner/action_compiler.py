@@ -38,6 +38,8 @@ from planner.action_plan_parser import (
 )
 from planner.action_templates import (
     fast_action_templates,
+    materialize_contextual_app_followup_search_for_text,
+    materialize_fresh_context_app_open_for_text,
     materialize_fresh_context_app_preference,
     materialize_gate_template,
     required_action_names_for_gate,
@@ -273,6 +275,20 @@ class ActionCompiler:
             and not gate.should_act
             and gate.confidence >= _action_intent_confidence_threshold()
         ):
+            app_preference_decision = self._decision_from_fresh_context_app_text(
+                message,
+                confidence=gate.confidence,
+                context=context,
+            )
+            if app_preference_decision is not None:
+                return app_preference_decision
+            app_followup_decision = self._decision_from_contextual_app_followup_search(
+                message,
+                confidence=gate.confidence,
+                context=context,
+            )
+            if app_followup_decision is not None:
+                return app_followup_decision
             return ActionIntentDecision(
                 should_act=False,
                 execution_mode="no_action",
@@ -311,6 +327,20 @@ class ActionCompiler:
                 message[:200],
             )
         elif not gate.should_act:
+            app_preference_decision = self._decision_from_fresh_context_app_text(
+                message,
+                confidence=gate.confidence,
+                context=context,
+            )
+            if app_preference_decision is not None:
+                return app_preference_decision
+            app_followup_decision = self._decision_from_contextual_app_followup_search(
+                message,
+                confidence=gate.confidence,
+                context=context,
+            )
+            if app_followup_decision is not None:
+                return app_followup_decision
             if (
                 not _action_compiler_fallback_on_low_confidence_no_action()
                 and not _has_working_context_followup_state(context)
@@ -540,6 +570,44 @@ class ActionCompiler:
                 template_key_for_gate(gate),
                 gate.intent,
             )
+            return self._decision_from_plan(plan, message="", context=context)
+        return None
+
+    def _decision_from_fresh_context_app_text(
+        self,
+        text: str,
+        *,
+        confidence: float,
+        context: dict[str, Any] | None,
+    ) -> ActionIntentDecision | None:
+        materialized = materialize_fresh_context_app_open_for_text(
+            text,
+            confidence=confidence,
+            context=context,
+            reason="fresh action context matched runtime app metadata",
+        )
+        plan = materialized.plan
+        if isinstance(plan, ClientActionPlan):
+            logger.info("action compiler recovered local app preference from metadata")
+            return self._decision_from_plan(plan, message="", context=context)
+        return None
+
+    def _decision_from_contextual_app_followup_search(
+        self,
+        text: str,
+        *,
+        confidence: float,
+        context: dict[str, Any] | None,
+    ) -> ActionIntentDecision | None:
+        materialized = materialize_contextual_app_followup_search_for_text(
+            text,
+            confidence=confidence,
+            context=context,
+            reason="contextual app follow-up matched runtime app metadata",
+        )
+        plan = materialized.plan
+        if isinstance(plan, ClientActionPlan):
+            logger.info("action compiler recovered app follow-up browser search")
             return self._decision_from_plan(plan, message="", context=context)
         return None
 

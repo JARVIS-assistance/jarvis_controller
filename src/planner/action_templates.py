@@ -281,6 +281,27 @@ def materialize_fresh_context_app_preference(
     query = _slot_string(gate.slots or {}, "query", "search_query", "terms")
     if query is None:
         return TemplateMaterialization()
+    return materialize_fresh_context_app_open_for_text(
+        query,
+        confidence=gate.confidence,
+        context=context,
+        reason="fresh action context prefers matching local app",
+    )
+
+
+def materialize_fresh_context_app_open_for_text(
+    text: str,
+    *,
+    confidence: float,
+    context: dict[str, Any] | None,
+    reason: str,
+) -> TemplateMaterialization:
+    """Open a local app when fresh-context text matches runtime app metadata."""
+    if not _is_fresh_action_context(context):
+        return TemplateMaterialization()
+    query = text.strip()
+    if not query:
+        return TemplateMaterialization()
     app_name = _matching_application_for_text(query, context)
     if app_name is None:
         return TemplateMaterialization()
@@ -289,8 +310,8 @@ def materialize_fresh_context_app_preference(
         json.dumps(fast_action_templates()["app_open"], ensure_ascii=False)
     )
     payload["goal"] = f"Open {app_name}"
-    payload["confidence"] = max(float(payload.get("confidence") or 0), gate.confidence)
-    payload["reason"] = "fresh action context prefers matching local app"
+    payload["confidence"] = max(float(payload.get("confidence") or 0), confidence)
+    payload["reason"] = reason
     payload["actions"][0]["target"] = app_name
     payload["actions"][0]["description"] = f"Open {app_name}"
     try:
@@ -302,7 +323,44 @@ def materialize_fresh_context_app_preference(
                     "invalid_app_preference_template_plan",
                     "Fresh-context app preference produced an invalid action plan.",
                     field="action_templates",
-                    details={"template_key": template_key, "errors": exc.errors()},
+                    details={"template_key": "app_open", "errors": exc.errors()},
+                )
+            ]
+        )
+
+
+def materialize_contextual_app_followup_search_for_text(
+    text: str,
+    *,
+    confidence: float,
+    context: dict[str, Any] | None,
+    reason: str,
+) -> TemplateMaterialization:
+    """Search the browser for app-domain follow-ups after a local app action."""
+    query = text.strip()
+    if not query or not _context_supports_action(context, "browser.search"):
+        return TemplateMaterialization()
+    if not _text_matches_active_application(query, context):
+        return TemplateMaterialization()
+
+    payload = json.loads(
+        json.dumps(fast_action_templates()["browser_search"], ensure_ascii=False)
+    )
+    payload["goal"] = "Search browser"
+    payload["confidence"] = max(float(payload.get("confidence") or 0), confidence)
+    payload["reason"] = reason
+    payload["actions"][0]["args"]["query"] = query
+    payload["actions"][0]["description"] = "Search browser"
+    try:
+        return TemplateMaterialization(plan=ClientActionPlan.model_validate(payload))
+    except ValidationError as exc:
+        return TemplateMaterialization(
+            issues=[
+                _issue(
+                    "invalid_contextual_followup_search_template_plan",
+                    "Contextual app follow-up produced an invalid action plan.",
+                    field="action_templates",
+                    details={"template_key": "browser_search", "errors": exc.errors()},
                 )
             ]
         )
@@ -471,6 +529,80 @@ def _matching_application_for_text(
     return None
 
 
+def _text_matches_active_application(
+    text: str,
+    context: dict[str, Any] | None,
+) -> bool:
+    active_names = _active_application_names(context)
+    if not active_names:
+        return False
+    raw = (context or {}).get("available_applications")
+    if not isinstance(raw, list):
+        return False
+    active_keys = {_application_match_key(name) for name in active_names}
+    text_key = _application_match_key(text)
+    if not text_key:
+        return False
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        app_names = _application_identity_candidates(item)
+        if not any(_application_match_key(name) in active_keys for name in app_names):
+            continue
+        for candidate in _application_match_candidates(item):
+            candidate_key = _application_match_key(candidate)
+            if len(candidate_key) >= 2 and candidate_key in text_key:
+                return True
+    return False
+
+
+def _active_application_names(context: dict[str, Any] | None) -> list[str]:
+    if not isinstance(context, dict):
+        return []
+    names: list[str] = []
+    working_context = context.get("working_context")
+    if isinstance(working_context, dict):
+        names.extend(
+            value.strip()
+            for key in ("active_app", "launched_app", "app")
+            for value in [working_context.get(key)]
+            if isinstance(value, str) and value.strip()
+        )
+    latest_action_result = context.get("latest_action_result")
+    if isinstance(latest_action_result, dict):
+        names.extend(
+            value.strip()
+            for key in ("active_app", "launched_app", "app")
+            for value in [latest_action_result.get(key)]
+            if isinstance(value, str) and value.strip()
+        )
+    latest_observation = context.get("latest_observation")
+    if isinstance(latest_observation, dict):
+        names.extend(
+            value.strip()
+            for key in ("active_app", "launched_app", "app")
+            for value in [latest_observation.get(key)]
+            if isinstance(value, str) and value.strip()
+        )
+    return list(dict.fromkeys(names))
+
+
+def _application_identity_candidates(item: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for key in ("name", "display_name", "bundle_id"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+    aliases = item.get("aliases")
+    if isinstance(aliases, list):
+        candidates.extend(
+            entry.strip()
+            for entry in aliases
+            if isinstance(entry, str) and entry.strip()
+        )
+    return list(dict.fromkeys(candidates))
+
+
 def _application_match_candidates(item: dict[str, Any]) -> list[str]:
     candidates: list[str] = []
     for key in ("name", "display_name", "kind"):
@@ -486,6 +618,49 @@ def _application_match_candidates(item: dict[str, Any]) -> list[str]:
                 if isinstance(entry, str) and entry.strip()
             )
     return list(dict.fromkeys(candidates))
+
+
+def _context_supports_action(
+    context: dict[str, Any] | None,
+    action_name: str,
+) -> bool:
+    capabilities = (context or {}).get("capabilities")
+    if not capabilities:
+        return True
+    candidates = _action_capability_candidates(action_name)
+    if isinstance(capabilities, dict):
+        for candidate in candidates:
+            value = capabilities.get(candidate)
+            if _capability_value_enabled(value):
+                return True
+        return False
+    if isinstance(capabilities, list):
+        for item in capabilities:
+            if isinstance(item, str) and item in candidates:
+                return True
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("capability") or item.get("id")
+                if isinstance(name, str) and name in candidates:
+                    return _capability_value_enabled(item)
+        return False
+    return True
+
+
+def _action_capability_candidates(action_name: str) -> set[str]:
+    namespace = action_name.split(".", 1)[0]
+    legacy = {
+        "browser": {"browser_control", "open_url"},
+        "app": {"app_control"},
+    }
+    return {action_name, namespace, *legacy.get(namespace, set())}
+
+
+def _capability_value_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, dict):
+        return value.get("enabled", True) is not False
+    return bool(value)
 
 
 def _valid_screenshot_region(value: Any) -> bool:

@@ -912,6 +912,118 @@ def test_action_compiler_prefers_matching_local_app_for_fresh_action_context(
     assert len(calls) == 1
 
 
+def test_action_compiler_recovers_app_open_when_gate_misses_fresh_app_metadata(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    calls: list[dict[str, object]] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append({"payload": payload, "timeout": timeout})
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": False,
+                                "intent": "none",
+                                "confidence": 0.95,
+                                "reason": "contextual follow-up",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="오늘 날씨 어때?",
+        context={
+            "capabilities": ["app.open", "browser.search"],
+            "available_applications": [
+                {
+                    "name": "Weather",
+                    "aliases": ["weather", "날씨"],
+                    "capabilities": ["weather", "forecast", "예보"],
+                    "categories": ["weather"],
+                },
+            ],
+        },
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "app_control"
+    assert decision.actions[0].command == "open"
+    assert decision.actions[0].target == "Weather"
+    assert len(calls) == 1
+
+
+def test_action_compiler_recovers_browser_search_for_app_followup_no_action_gate(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    calls: list[dict[str, object]] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append({"payload": payload, "timeout": timeout})
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": False,
+                                "intent": "none",
+                                "confidence": 0.95,
+                                "reason": "ordinary conversation",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="대구 지역의 날씨는 어때?",
+        context={
+            "capabilities": ["app.open", "browser.search"],
+            "latest_action_result": {
+                "app": "Weather",
+                "command": "open",
+                "active_app": "Weather",
+                "launched_app": "Weather",
+                "bundle_id": "com.apple.weather",
+                "source": "app_control",
+            },
+            "available_applications": [
+                {
+                    "name": "Weather",
+                    "aliases": ["weather", "날씨"],
+                    "bundle_id": "com.apple.weather",
+                    "capabilities": ["weather", "forecast", "예보"],
+                    "categories": ["weather"],
+                },
+            ],
+        },
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "open_url"
+    assert decision.actions[0].args["query"] == "대구 지역의 날씨는 어때?"
+    assert len(calls) == 1
+
+
 def test_action_compiler_keeps_browser_search_when_working_context_exists(
     monkeypatch,
 ) -> None:

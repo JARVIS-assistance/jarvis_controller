@@ -174,7 +174,7 @@ class ActionContextStore:
         now: float,
     ) -> None:
         if action.type == "app_control":
-            app_name = _app_target(action)
+            app_name = _app_result_app_name(output) or _app_target(action)
             if app_name:
                 working.active_surface = "app"
                 working.active_app = app_name
@@ -283,6 +283,19 @@ def _result_payload(value: ActionResultContext) -> dict[str, Any]:
         "status": value.status,
         "output": value.output,
     }
+    if value.action_type == "app_control":
+        app_name = _app_result_app_name(value.output) or value.target
+        if app_name:
+            payload["app"] = app_name
+            payload["active_app"] = _output_string(value.output, "active_app") or app_name
+            if value.command == "open":
+                payload["launched_app"] = (
+                    _output_string(value.output, "launched_app") or app_name
+                )
+        for key in ("bundle_id", "source"):
+            item = _output_string(value.output, key)
+            if item:
+                payload[key] = item
     if value.action_id:
         payload["action_id"] = value.action_id
     if value.description:
@@ -302,6 +315,21 @@ def _app_target(action: ClientAction) -> str | None:
         value = args.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
+    return None
+
+
+def _app_result_app_name(output: dict[str, Any]) -> str | None:
+    for key in ("active_app", "launched_app", "app"):
+        value = _output_string(output, key)
+        if value:
+            return value
+    return None
+
+
+def _output_string(output: dict[str, Any], key: str) -> str | None:
+    value = output.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
     return None
 
 

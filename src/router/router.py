@@ -914,7 +914,33 @@ def _action_result_context_payload(value: object) -> dict[str, object]:
         item = getattr(value, key, None)
         if item is not None:
             payload[key] = item
+    output = payload.get("output")
+    if payload.get("action_type") == "app_control" and isinstance(output, dict):
+        app_name = (
+            _string_from_mapping(output, "active_app")
+            or _string_from_mapping(output, "launched_app")
+            or _string_from_mapping(output, "app")
+            or _string_from_mapping(payload, "target")
+        )
+        if app_name:
+            payload["app"] = app_name
+            payload["active_app"] = _string_from_mapping(output, "active_app") or app_name
+            if payload.get("command") == "open":
+                payload["launched_app"] = (
+                    _string_from_mapping(output, "launched_app") or app_name
+                )
+        for key in ("bundle_id", "source"):
+            item = _string_from_mapping(output, key)
+            if item:
+                payload[key] = item
     return payload
+
+
+def _string_from_mapping(mapping: dict[str, object], key: str) -> str | None:
+    value = mapping.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
 def _trim_action_context_for_message(
