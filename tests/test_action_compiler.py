@@ -185,6 +185,7 @@ def test_action_compiler_rechecks_low_confidence_no_action_gate(monkeypatch) -> 
     monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
     monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
     monkeypatch.setenv("JARVIS_ACTION_INTENT_CONFIDENCE_THRESHOLD", "0.72")
+    monkeypatch.setenv("JARVIS_ACTION_COMPILER_FALLBACK_ON_LOW_CONFIDENCE_NO_ACTION", "1")
     calls = 0
 
     def fake_post_json(url, payload, *, timeout):
@@ -240,6 +241,49 @@ def test_action_compiler_rechecks_low_confidence_no_action_gate(monkeypatch) -> 
     assert decision.should_act is True
     assert decision.actions[0].type == "browser"
     assert calls == 2
+
+
+def test_action_compiler_trusts_low_confidence_no_action_gate_by_default(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_CONFIDENCE_THRESHOLD", "0.72")
+    monkeypatch.delenv(
+        "JARVIS_ACTION_COMPILER_FALLBACK_ON_LOW_CONFIDENCE_NO_ACTION",
+        raising=False,
+    )
+    calls = 0
+
+    def fake_post_json(url, payload, *, timeout):
+        nonlocal calls
+        calls += 1
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": False,
+                                "intent": "none",
+                                "confidence": 0.0,
+                                "reason": "uncertain no action",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(message="안녕?")
+
+    assert decision is not None
+    assert decision.should_act is False
+    assert decision.execution_mode == "no_action"
+    assert decision.reason == "uncertain no action"
+    assert calls == 1
 
 
 def test_action_compiler_accepts_yaml_style_plan_after_gate_fallback(monkeypatch) -> None:

@@ -311,6 +311,21 @@ class ActionCompiler:
                 message[:200],
             )
         elif not gate.should_act:
+            if (
+                not _action_compiler_fallback_on_low_confidence_no_action()
+                and not _has_working_context_followup_state(context)
+                and not validation_errors
+            ):
+                return ActionIntentDecision(
+                    should_act=False,
+                    execution_mode="no_action",
+                    intent=gate.intent or "none",
+                    confidence=gate.confidence,
+                    reason=gate.reason,
+                    actions=[],
+                    plan=None,
+                    validation_errors=[],
+                )
             logger.info(
                 "action intent gate confidence below threshold; trying plan compiler "
                 "fallback confidence=%.2f threshold=%.2f message=%s",
@@ -1040,6 +1055,14 @@ def _action_intent_confidence_threshold() -> float:
 def _action_compiler_fallback_on_intent_unavailable() -> bool:
     raw = os.getenv(
         "JARVIS_ACTION_COMPILER_FALLBACK_ON_INTENT_UNAVAILABLE",
+        "0",
+    ).lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _action_compiler_fallback_on_low_confidence_no_action() -> bool:
+    raw = os.getenv(
+        "JARVIS_ACTION_COMPILER_FALLBACK_ON_LOW_CONFIDENCE_NO_ACTION",
         "0",
     ).lower()
     return raw in {"1", "true", "yes", "on"}
