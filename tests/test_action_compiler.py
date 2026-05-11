@@ -855,7 +855,7 @@ def test_action_compiler_uses_gate_template_after_repeated_no_action(monkeypatch
     assert decision.actions[0].args["query"] == "네이버웹툰"
     assert decision.actions[1].command == "select_result"
     assert decision.actions[1].args == {"index": 1}
-    assert len(calls) == 3
+    assert len(calls) == 1
 
 
 def test_action_compiler_prefers_matching_local_app_for_fresh_action_context(
@@ -1024,6 +1024,51 @@ def test_action_compiler_recovers_browser_search_for_app_followup_no_action_gate
     assert len(calls) == 1
 
 
+def test_action_compiler_recovers_explicit_search_when_gate_hallucinates_app(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    calls: list[dict[str, object]] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append({"payload": payload, "timeout": timeout})
+        if len(calls) == 1:
+            content = {
+                "should_act": True,
+                "intent": "app.open+keyboard.type",
+                "template_key": "app_open_type",
+                "slots": {
+                    "app_name": "Sublime Text",
+                    "text": "소불고기 레시피를 알려줘.",
+                },
+                "confidence": 0.95,
+                "reason": "misclassified search request",
+            }
+        else:
+            content = {"mode": "chat", "content": "소불고기 레시피"}
+        return {"choices": [{"message": {"content": json.dumps(content)}}]}
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="소불고기 레시피 찾아줘",
+        context={
+            "capabilities": ["app.open", "browser.search", "keyboard.type"],
+            "available_applications": [
+                {"name": "Sublime Text", "aliases": ["sublimetext"]}
+            ],
+        },
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "open_url"
+    assert decision.actions[0].args["query"] == "소불고기 레시피 찾아줘"
+    assert len(calls) == 2
+
+
 def test_action_compiler_keeps_browser_search_when_working_context_exists(
     monkeypatch,
 ) -> None:
@@ -1081,7 +1126,7 @@ def test_action_compiler_keeps_browser_search_when_working_context_exists(
     assert decision.execution_mode == "direct"
     assert decision.actions[0].type == "open_url"
     assert decision.actions[0].args["query"] == "대구 날씨"
-    assert len(calls) == 2
+    assert len(calls) == 1
 
 
 def test_action_compiler_repairs_incomplete_multi_step_template_plan(monkeypatch) -> None:
@@ -1158,15 +1203,7 @@ def test_action_compiler_repairs_incomplete_multi_step_template_plan(monkeypatch
     assert [action.type for action in decision.actions] == ["app_control", "keyboard_type"]
     assert decision.actions[0].target == "Sublime Text"
     assert decision.actions[1].payload == intro
-    assert len(calls) == 3
-    retry_payload = json.loads(calls[2]["payload"]["messages"][-1]["content"])
-    retry_error = retry_payload["validation_errors"][0]
-    assert retry_error["code"] == "intent_template_incomplete"
-    assert retry_error["field"] == "actions"
-    assert retry_error["action_name"] == "keyboard.type"
-    assert retry_error["details"]["expected_actions"] == ["app.open", "keyboard.type"]
-    assert retry_error["details"]["actual_actions"] == ["app.open"]
-    assert retry_error["details"]["missing_actions"] == ["keyboard.type"]
+    assert len(calls) == 1
 
 
 def test_action_compiler_does_not_dispatch_incomplete_template_without_slots(
@@ -1242,7 +1279,7 @@ def test_action_compiler_does_not_dispatch_incomplete_template_without_slots(
     assert decision.validation_errors
     assert decision.validation_errors[0].code == "missing_template_slot"
     assert decision.validation_errors[0].field == "slots.text"
-    assert len(calls) == 3
+    assert len(calls) == 1
 
 
 def test_action_compiler_uses_working_context_for_followup_template_fallback(
@@ -1312,12 +1349,7 @@ def test_action_compiler_uses_working_context_for_followup_template_fallback(
     assert decision.actions[1].payload == "Hello. I am JARVIS."
     gate_payload = json.loads(calls[0]["payload"]["messages"][-1]["content"])
     assert gate_payload["runtime_context"]["working_context"]["active_app"] == "Sublime Text"
-    compiler_payload = json.loads(calls[1]["payload"]["messages"][-1]["content"])
-    assert (
-        compiler_payload["runtime_context"]["working_context"]["last_typed_text"]
-        == "안녕하세요. 저는 JARVIS입니다."
-    )
-    assert len(calls) == 2
+    assert len(calls) == 1
 
 
 def test_action_compiler_retries_no_action_when_gate_unavailable_with_working_context(
@@ -1722,7 +1754,7 @@ def test_action_compiler_uses_screenshot_template_after_repeated_no_action(monke
     assert decision.execution_mode == "direct"
     assert len(decision.actions) == 1
     assert decision.actions[0].type == "screenshot"
-    assert len(calls) == 3
+    assert len(calls) == 1
 
 
 def test_action_compiler_rejects_gate_template_when_required_slot_missing(monkeypatch) -> None:
@@ -1783,7 +1815,7 @@ def test_action_compiler_rejects_gate_template_when_required_slot_missing(monkey
     assert decision.validation_errors
     assert decision.validation_errors[0].code == "missing_template_slot"
     assert decision.validation_errors[0].field == "slots.query"
-    assert len(calls) == 3
+    assert len(calls) == 1
 
 
 def test_action_compiler_adapts_browser_open_without_url_to_browser_action(monkeypatch) -> None:

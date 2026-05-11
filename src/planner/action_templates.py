@@ -343,6 +343,50 @@ def materialize_contextual_app_followup_search_for_text(
     if not _text_matches_active_application(query, context):
         return TemplateMaterialization()
 
+    template_key = (
+        "browser_search_open_first"
+        if _looks_like_search_open_first_request(query)
+        and _context_supports_action(context, "browser.select_result")
+        else "browser_search"
+    )
+    payload = json.loads(json.dumps(fast_action_templates()[template_key], ensure_ascii=False))
+    payload["goal"] = "Search browser"
+    payload["confidence"] = max(float(payload.get("confidence") or 0), confidence)
+    payload["reason"] = reason
+    payload["actions"][0]["args"]["query"] = query
+    payload["actions"][0]["description"] = "Search browser"
+    if template_key == "browser_search_open_first":
+        payload["goal"] = "Search and open first result"
+        payload["actions"][1]["args"]["index"] = 1
+    try:
+        return TemplateMaterialization(plan=ClientActionPlan.model_validate(payload))
+    except ValidationError as exc:
+        return TemplateMaterialization(
+            issues=[
+                _issue(
+                    "invalid_contextual_followup_search_template_plan",
+                    "Contextual app follow-up produced an invalid action plan.",
+                    field="action_templates",
+                    details={"template_key": template_key, "errors": exc.errors()},
+                )
+            ]
+        )
+
+
+def materialize_browser_search_for_text(
+    text: str,
+    *,
+    confidence: float,
+    context: dict[str, Any] | None,
+    reason: str,
+) -> TemplateMaterialization:
+    """Search the browser when the user explicitly asks to search/find."""
+    query = text.strip()
+    if not query or not _context_supports_action(context, "browser.search"):
+        return TemplateMaterialization()
+    if not _looks_like_browser_search_request(query):
+        return TemplateMaterialization()
+
     payload = json.loads(
         json.dumps(fast_action_templates()["browser_search"], ensure_ascii=False)
     )
@@ -357,8 +401,8 @@ def materialize_contextual_app_followup_search_for_text(
         return TemplateMaterialization(
             issues=[
                 _issue(
-                    "invalid_contextual_followup_search_template_plan",
-                    "Contextual app follow-up produced an invalid action plan.",
+                    "invalid_browser_search_template_plan",
+                    "Browser search fallback produced an invalid action plan.",
                     field="action_templates",
                     details={"template_key": "browser_search", "errors": exc.errors()},
                 )
@@ -603,6 +647,44 @@ def _application_identity_candidates(item: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(candidates))
 
 
+def application_mentioned_in_text(
+    app_name: str,
+    text: str,
+    context: dict[str, Any] | None,
+) -> bool:
+    text_key = _application_match_key(text)
+    if not text_key:
+        return False
+    for candidate in _application_candidates_for_name(app_name, context):
+        candidate_key = _application_match_key(candidate)
+        if len(candidate_key) >= 2 and candidate_key in text_key:
+            return True
+    return False
+
+
+def _application_candidates_for_name(
+    app_name: str,
+    context: dict[str, Any] | None,
+) -> list[str]:
+    candidates = [app_name]
+    requested = _application_match_key(app_name)
+    raw = (context or {}).get("available_applications")
+    if not isinstance(raw, list) or not requested:
+        return candidates
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        identity_candidates = _application_identity_candidates(item)
+        if not any(
+            _application_match_key(candidate) == requested
+            for candidate in identity_candidates
+        ):
+            continue
+        candidates.extend(identity_candidates)
+        candidates.extend(_application_match_candidates(item))
+    return list(dict.fromkeys(candidates))
+
+
 def _application_match_candidates(item: dict[str, Any]) -> list[str]:
     candidates: list[str] = []
     for key in ("name", "display_name", "kind"):
@@ -661,6 +743,44 @@ def _capability_value_enabled(value: Any) -> bool:
     if isinstance(value, dict):
         return value.get("enabled", True) is not False
     return bool(value)
+
+
+def _looks_like_browser_search_request(text: str) -> bool:
+    lowered = text.casefold()
+    compact = _application_match_key(text)
+    search_terms = (
+        "검색",
+        "찾아줘",
+        "찾아 줘",
+        "찾아봐",
+        "찾아 봐",
+        "찾아줄래",
+        "찾아 줄래",
+        "search",
+        "find",
+        "look up",
+        "lookup",
+    )
+    if any(term in lowered for term in search_terms):
+        return True
+    return any(term in compact for term in ("찾아줘", "찾아봐", "찾아줄래"))
+
+
+def _looks_like_search_open_first_request(text: str) -> bool:
+    lowered = text.casefold()
+    compact = _application_match_key(text)
+    open_terms = (
+        "들어가",
+        "들어가줘",
+        "들어가 줘",
+        "열어줘",
+        "열어 줘",
+        "open",
+        "go to",
+    )
+    return any(term in lowered for term in open_terms) or any(
+        term in compact for term in ("들어가", "들어가줘", "열어줘")
+    )
 
 
 def _valid_screenshot_region(value: Any) -> bool:

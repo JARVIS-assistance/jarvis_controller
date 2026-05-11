@@ -37,7 +37,9 @@ from planner.action_plan_parser import (
     parse_plan,
 )
 from planner.action_templates import (
+    application_mentioned_in_text,
     fast_action_templates,
+    materialize_browser_search_for_text,
     materialize_contextual_app_followup_search_for_text,
     materialize_fresh_context_app_open_for_text,
     materialize_fresh_context_app_preference,
@@ -310,6 +312,13 @@ class ActionCompiler:
             )
             if app_preference_decision is not None:
                 return app_preference_decision
+            template_decision = self._decision_from_trusted_gate_template(
+                gate,
+                message=message,
+                context=context,
+            )
+            if template_decision is not None:
+                return template_decision
         if gate is None:
             if (
                 not _action_compiler_fallback_on_intent_unavailable()
@@ -364,6 +373,26 @@ class ActionCompiler:
                 message[:200],
             )
 
+        if (
+            gate is not None
+            and gate.should_act
+            and gate.confidence < _action_intent_confidence_threshold()
+        ):
+            search_decision = self._decision_from_explicit_browser_search_text(
+                message,
+                confidence=gate.confidence,
+                context=context,
+            )
+            if search_decision is not None:
+                return search_decision
+            logger.info(
+                "action intent gate actionable confidence below threshold; trying "
+                "plan compiler fallback confidence=%.2f threshold=%.2f message=%s",
+                gate.confidence,
+                _action_intent_confidence_threshold(),
+                message[:200],
+            )
+
         plan = self.compile_plan(
             message=message,
             context=context,
@@ -372,6 +401,14 @@ class ActionCompiler:
             intent_gate=gate,
         )
         if plan is None:
+            if gate is not None and gate.should_act:
+                search_decision = self._decision_from_explicit_browser_search_text(
+                    message,
+                    confidence=gate.confidence,
+                    context=context,
+                )
+                if search_decision is not None:
+                    return search_decision
             return None
 
         if (
@@ -610,6 +647,36 @@ class ActionCompiler:
             logger.info("action compiler recovered app follow-up browser search")
             return self._decision_from_plan(plan, message="", context=context)
         return None
+
+    def _decision_from_explicit_browser_search_text(
+        self,
+        text: str,
+        *,
+        confidence: float,
+        context: dict[str, Any] | None,
+    ) -> ActionIntentDecision | None:
+        materialized = materialize_browser_search_for_text(
+            text,
+            confidence=confidence,
+            context=context,
+            reason="explicit browser search request",
+        )
+        plan = materialized.plan
+        if isinstance(plan, ClientActionPlan):
+            logger.info("action compiler recovered explicit browser search")
+            return self._decision_from_plan(plan, message="", context=context)
+        return None
+
+    def _decision_from_trusted_gate_template(
+        self,
+        gate: ActionIntentGate,
+        *,
+        message: str,
+        context: dict[str, Any] | None,
+    ) -> ActionIntentDecision | None:
+        if not _gate_template_is_grounded(gate, message=message, context=context):
+            return None
+        return self._decision_from_gate_template(gate, context=context)
 
     def _decision_from_gate_template(
         self,
@@ -967,6 +1034,35 @@ def _working_context_retry_details(
     if isinstance(recent_actions, list):
         details["recent_action_count"] = len(recent_actions)
     return details
+
+
+def _gate_template_is_grounded(
+    gate: ActionIntentGate,
+    *,
+    message: str,
+    context: dict[str, Any] | None,
+) -> bool:
+    if not gate.should_act:
+        return False
+    if not gate.template_key:
+        return False
+    template_key = template_key_for_gate(gate)
+    if template_key not in {"app_open", "app_open_type"}:
+        return True
+    slots = gate.slots or {}
+    app_name = _slot_text(slots, "app_name", "application", "application_name", "target")
+    active_app = _working_context_string(context, "active_app")
+    if app_name:
+        return application_mentioned_in_text(app_name, message, context)
+    return bool(active_app and _has_working_context_followup_state(context))
+
+
+def _slot_text(slots: dict[str, Any], *names: str) -> str | None:
+    for name in names:
+        value = slots.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
 
 
 def _missing_ordered_action_names(
