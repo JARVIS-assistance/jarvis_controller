@@ -283,6 +283,17 @@ class ActionCompiler:
                 validation_errors=[],
             )
         if gate is None:
+            if (
+                not _action_compiler_fallback_on_intent_unavailable()
+                and not _has_working_context_followup_state(context)
+                and not validation_errors
+            ):
+                logger.warning(
+                    "action intent gate unavailable; skipping plan compiler fallback "
+                    "message=%s",
+                    message[:200],
+                )
+                return None
             logger.warning(
                 "action intent gate unavailable; trying plan compiler fallback message=%s",
                 message[:200],
@@ -992,6 +1003,14 @@ def _action_intent_confidence_threshold() -> float:
             _float_env("JARVIS_ACTION_INTENT_CONFIDENCE_THRESHOLD", 0.72),
         ),
     )
+
+
+def _action_compiler_fallback_on_intent_unavailable() -> bool:
+    raw = os.getenv(
+        "JARVIS_ACTION_COMPILER_FALLBACK_ON_INTENT_UNAVAILABLE",
+        "0",
+    ).lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _issue(

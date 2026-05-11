@@ -157,6 +157,30 @@ def test_action_compiler_stops_when_intent_gate_returns_no_action(monkeypatch) -
     assert calls == 1
 
 
+def test_action_compiler_skips_plan_fallback_when_intent_gate_unavailable(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.delenv(
+        "JARVIS_ACTION_COMPILER_FALLBACK_ON_INTENT_UNAVAILABLE",
+        raising=False,
+    )
+    calls = 0
+
+    def fake_post_json(url, payload, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise TimeoutError("intent gate timeout")
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(message="안녕?")
+
+    assert decision is None
+    assert calls == 1
+
+
 def test_action_compiler_rechecks_low_confidence_no_action_gate(monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
     monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
@@ -221,6 +245,7 @@ def test_action_compiler_rechecks_low_confidence_no_action_gate(monkeypatch) -> 
 def test_action_compiler_accepts_yaml_style_plan_after_gate_fallback(monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
     monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    monkeypatch.setenv("JARVIS_ACTION_COMPILER_FALLBACK_ON_INTENT_UNAVAILABLE", "1")
     calls = 0
 
     def fake_post_json(url, payload, *, timeout):
@@ -451,6 +476,7 @@ def test_action_compiler_tries_plan_when_intent_gate_returns_invalid_text(monkey
     monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
     monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "ollama_chat")
     monkeypatch.setenv("JARVIS_ACTION_MODEL_ENDPOINT", "https://ollma.breakpack.cc")
+    monkeypatch.setenv("JARVIS_ACTION_COMPILER_FALLBACK_ON_INTENT_UNAVAILABLE", "1")
     calls: list[str] = []
 
     def fake_post_json(url, payload, *, timeout):
