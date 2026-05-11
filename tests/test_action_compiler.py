@@ -814,6 +814,120 @@ def test_action_compiler_uses_gate_template_after_repeated_no_action(monkeypatch
     assert len(calls) == 3
 
 
+def test_action_compiler_prefers_matching_local_app_for_fresh_action_context(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    calls: list[dict[str, object]] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append({"payload": payload, "timeout": timeout})
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": True,
+                                "intent": "browser.search",
+                                "template_key": "browser_search",
+                                "slots": {"query": "오늘 날씨"},
+                                "confidence": 0.95,
+                                "reason": "fresh task can be handled by a local app",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="오늘 날씨 알려줘",
+        context={
+            "capabilities": ["app.open", "browser.search"],
+            "available_applications": [
+                {
+                    "name": "Weather",
+                    "aliases": ["weather"],
+                    "capabilities": ["날씨", "forecast"],
+                },
+            ],
+        },
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert len(decision.actions) == 1
+    assert decision.actions[0].type == "app_control"
+    assert decision.actions[0].command == "open"
+    assert decision.actions[0].target == "Weather"
+    assert len(calls) == 1
+
+
+def test_action_compiler_keeps_browser_search_when_working_context_exists(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    calls: list[dict[str, object]] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append({"payload": payload, "timeout": timeout})
+        if len(calls) == 1:
+            content = {
+                "should_act": True,
+                "intent": "browser.search",
+                "template_key": "browser_search",
+                "slots": {"query": "대구 날씨"},
+                "confidence": 0.95,
+                "reason": "follow-up asks for more specific current information",
+            }
+        else:
+            content = {
+                "mode": "direct",
+                "goal": "Search browser",
+                "confidence": 0.9,
+                "reason": "follow-up uses browser search",
+                "actions": [
+                    {
+                        "name": "browser.search",
+                        "args": {"query": "대구 날씨"},
+                        "description": "Search browser",
+                        "requires_confirm": False,
+                    }
+                ],
+            }
+        return {"choices": [{"message": {"content": json.dumps(content)}}]}
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="대구 지역의 날씨는 어때?",
+        context={
+            "capabilities": ["app.open", "browser.search"],
+            "working_context": {"active_app": "Weather"},
+            "available_applications": [
+                {
+                    "name": "Weather",
+                    "aliases": ["weather"],
+                    "capabilities": ["날씨", "forecast"],
+                },
+            ],
+        },
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "open_url"
+    assert decision.actions[0].args["query"] == "대구 날씨"
+    assert len(calls) == 2
+
+
 def test_action_compiler_repairs_incomplete_multi_step_template_plan(monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
     monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
@@ -1723,6 +1837,9 @@ def test_action_intent_gate_prompt_guides_korean_polite_requests() -> None:
     assert "현재화면 캡쳐해서 사진으로 띄워줘" in prompt
     assert "screen.screenshot" in prompt
     assert "추천해줘" in prompt
+    assert "Fresh-context app priority" in prompt
+    assert "prefer template_key=app_open" in prompt
+    assert "Working-context follow-up routing" in prompt
     assert "점심 메뉴 추천해줘" in prompt
     assert "한식 레츠고" in prompt
     assert "menu recommendation follow-up" in prompt

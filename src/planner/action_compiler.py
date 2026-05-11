@@ -38,6 +38,7 @@ from planner.action_plan_parser import (
 )
 from planner.action_templates import (
     fast_action_templates,
+    materialize_fresh_context_app_preference,
     materialize_gate_template,
     required_action_names_for_gate,
     template_key_for_gate,
@@ -282,6 +283,17 @@ class ActionCompiler:
                 plan=None,
                 validation_errors=[],
             )
+        if (
+            gate is not None
+            and gate.should_act
+            and gate.confidence >= _action_intent_confidence_threshold()
+        ):
+            app_preference_decision = self._decision_from_fresh_context_app_preference(
+                gate,
+                context=context,
+            )
+            if app_preference_decision is not None:
+                return app_preference_decision
         if gate is None:
             if (
                 not _action_compiler_fallback_on_intent_unavailable()
@@ -498,6 +510,24 @@ class ActionCompiler:
             retries_left -= 1
         return decision
 
+    def _decision_from_fresh_context_app_preference(
+        self,
+        gate: ActionIntentGate,
+        *,
+        context: dict[str, Any] | None,
+    ) -> ActionIntentDecision | None:
+        materialized = materialize_fresh_context_app_preference(gate, context=context)
+        plan = materialized.plan
+        if isinstance(plan, ClientActionPlan):
+            logger.info(
+                "action compiler preferring local app for fresh context "
+                "template=%s intent=%s",
+                template_key_for_gate(gate),
+                gate.intent,
+            )
+            return self._decision_from_plan(plan, message="", context=context)
+        return None
+
     def _decision_from_gate_template(
         self,
         gate: ActionIntentGate,
@@ -638,6 +668,7 @@ def should_try_client_action_classifier(message: str) -> bool:
 
 _fast_action_templates = fast_action_templates
 _materialize_gate_template = materialize_gate_template
+_materialize_fresh_context_app_preference = materialize_fresh_context_app_preference
 _template_key_for_gate = template_key_for_gate
 
 
@@ -938,7 +969,8 @@ def _plan_reuses_working_text_issue(
             return _issue(
                 "working_context_text_reused",
                 "The compiled keyboard.type text is identical to the previous typed text. "
-                "Generate the requested transformed or continued final text instead of copying the source, "
+                "Generate the requested transformed or continued final text instead of "
+                "copying the source, "
                 "unless the user explicitly requested an exact repeat.",
                 action_index=index,
                 action_name=action.name,

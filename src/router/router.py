@@ -69,6 +69,12 @@ _ACTION_ARBITRATION_DEFAULT_SECONDS = 0.0
 _ACTION_INTENT_CORE_FALLBACK_ENABLED = "JARVIS_ACTION_INTENT_CORE_FALLBACK_ENABLED"
 _ACTION_INTENT_DONE_GRACE_SECONDS = "JARVIS_ACTION_INTENT_DONE_GRACE_SECONDS"
 _ACTION_INTENT_DONE_GRACE_DEFAULT_SECONDS = 22.0
+_ACTION_CONTEXT_APPLICATION_LIMIT = "JARVIS_ACTION_CONTEXT_APPLICATION_LIMIT"
+_ACTION_CONTEXT_APPLICATION_DEFAULT_LIMIT = 250
+_ACTION_CONTEXT_TRIMMED_APPLICATION_NAME_LIMIT = (
+    "JARVIS_ACTION_CONTEXT_TRIMMED_APPLICATION_NAME_LIMIT"
+)
+_ACTION_CONTEXT_TRIMMED_APPLICATION_NAME_DEFAULT_LIMIT = 250
 _ACTION_ACK = "진행하겠습니다!"
 TokenAuth = Annotated[
     HTTPAuthorizationCredentials | None,
@@ -314,6 +320,26 @@ def _action_intent_done_grace_seconds() -> float:
         _ACTION_INTENT_DONE_GRACE_SECONDS,
         _ACTION_INTENT_DONE_GRACE_DEFAULT_SECONDS,
     ))
+
+
+def _action_context_application_limit() -> int:
+    return max(
+        30,
+        int(_float_env(
+            _ACTION_CONTEXT_APPLICATION_LIMIT,
+            _ACTION_CONTEXT_APPLICATION_DEFAULT_LIMIT,
+        )),
+    )
+
+
+def _action_context_trimmed_application_name_limit() -> int:
+    return max(
+        30,
+        int(_float_env(
+            _ACTION_CONTEXT_TRIMMED_APPLICATION_NAME_LIMIT,
+            _ACTION_CONTEXT_TRIMMED_APPLICATION_NAME_DEFAULT_LIMIT,
+        )),
+    )
 
 
 def _is_assistant_done_chunk(chunk: bytes) -> bool:
@@ -914,10 +940,13 @@ def _trim_action_context_for_message(
             if not isinstance(app, dict):
                 continue
             name = app.get("name")
-            aliases = app.get("aliases")
             candidates = [name] if isinstance(name, str) else []
-            if isinstance(aliases, list):
-                candidates.extend(alias for alias in aliases if isinstance(alias, str))
+            for key in ("display_name", "aliases", "capabilities", "categories", "keywords"):
+                value = app.get(key)
+                if isinstance(value, str):
+                    candidates.append(value)
+                elif isinstance(value, list):
+                    candidates.extend(item for item in value if isinstance(item, str))
             if any(candidate.strip().casefold() in message_key for candidate in candidates):
                 matched_apps.append(app)
                 if isinstance(name, str):
@@ -938,8 +967,12 @@ def _trim_action_context_for_message(
         trimmed["available_applications"] = matched_names[:30]
         trimmed["available_application_names"] = matched_names[:30]
     else:
+        trimmed["available_application_names"] = [
+            name
+            for name in names[:_action_context_trimmed_application_name_limit()]
+            if isinstance(name, str) and name.strip()
+        ]
         trimmed.pop("available_applications", None)
-        trimmed.pop("available_application_names", None)
     return trimmed
 
 
@@ -1028,7 +1061,7 @@ def _runtime_applications_for_context(value: object) -> list[dict[str, object]]:
     if not isinstance(value, list):
         return []
     applications: list[dict[str, object]] = []
-    for item in value[:150]:
+    for item in value[:_action_context_application_limit()]:
         if not isinstance(item, dict):
             continue
         name = item.get("name")
@@ -1039,9 +1072,10 @@ def _runtime_applications_for_context(value: object) -> list[dict[str, object]]:
             field_value = item.get(key)
             if isinstance(field_value, str) and field_value.strip():
                 app[key] = field_value.strip()
-        aliases = _string_list(item.get("aliases"))
-        if aliases:
-            app["aliases"] = aliases[:12]
+        for key in ("aliases", "capabilities", "categories", "keywords"):
+            values = _string_list(item.get(key))
+            if values:
+                app[key] = values[:12]
         applications.append(app)
     return applications
 

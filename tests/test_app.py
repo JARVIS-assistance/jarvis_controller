@@ -1,5 +1,5 @@
-import logging
 import json
+import logging
 import time
 
 from fastapi.testclient import TestClient
@@ -1267,6 +1267,37 @@ def test_action_context_trims_large_application_list_to_message_mentions() -> No
     assert trimmed is not None
     assert trimmed["available_applications"] == ["Sublime Text"]
     assert trimmed["available_application_names"] == ["Sublime Text"]
+
+
+def test_action_context_trims_large_application_list_to_app_metadata_match() -> None:
+    from router.router import _trim_action_context_for_message
+
+    context = {
+        "available_applications": [
+            {
+                "name": "Weather",
+                "aliases": ["weather"],
+                "capabilities": ["날씨", "forecast"],
+            },
+            *[{"name": f"App {index}"} for index in range(40)],
+        ],
+        "available_application_names": [
+            "Weather",
+            *[f"App {index}" for index in range(40)],
+        ],
+    }
+
+    trimmed = _trim_action_context_for_message(context, "오늘 날씨 알려줘")
+
+    assert trimmed is not None
+    assert trimmed["available_applications"] == [
+        {
+            "name": "Weather",
+            "aliases": ["weather"],
+            "capabilities": ["날씨", "forecast"],
+        }
+    ]
+    assert trimmed["available_application_names"] == ["Weather"]
 
 
 def test_stream_can_disable_core_action_fallback(monkeypatch) -> None:

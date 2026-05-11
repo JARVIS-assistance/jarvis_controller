@@ -228,11 +228,30 @@ User: 한식 레츠고
 """
 
 
+_INTENT_GATE_POLICY_OVERLAY = """Fresh-context app priority:
+- If runtime_context has no working_context and available application names or
+  available_applications contain an app that matches the user's requested task
+  by app name, alias, or clear task/domain fit, prefer template_key=app_open
+  over browser_search. Use the exact available app name in slots.app_name.
+- Do not invent unavailable apps. If no available app matches, keep the normal
+  browser/search/no-action rules.
+
+Working-context follow-up routing:
+- If working_context shows a recently opened/active app and the user asks for
+  more specific current information related to that surface, use browser_search
+  when the supported templates do not provide a direct app-specific operation.
+- Do not reopen the same app just because it is active in working_context.
+"""
+
+
 def intent_gate_prompt() -> str:
-    return (
-        _load_prompt_from_yaml(_ACTION_INTENT_GATE_PROMPT_KEY)
-        or _INTENT_GATE_PROMPT_FALLBACK
-    )
+    loaded_prompt = _load_prompt_from_yaml(_ACTION_INTENT_GATE_PROMPT_KEY)
+    if loaded_prompt and os.getenv(_PROMPTS_YAML_ENV):
+        return loaded_prompt
+    prompt = loaded_prompt or _INTENT_GATE_PROMPT_FALLBACK
+    if "Fresh-context app priority" in prompt:
+        return prompt
+    return f"{prompt.rstrip()}\n\n{_INTENT_GATE_POLICY_OVERLAY}"
 
 
 def _extract_json_object_or_intent_pairs(content: str) -> dict[str, Any]:

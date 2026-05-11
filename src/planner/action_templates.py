@@ -267,6 +267,47 @@ def materialize_gate_template(
         )
 
 
+def materialize_fresh_context_app_preference(
+    gate: ActionIntentGate,
+    *,
+    context: dict[str, Any] | None,
+) -> TemplateMaterialization:
+    """Prefer a matching local app over browser search in fresh action contexts."""
+    template_key = template_key_for_gate(gate)
+    if template_key not in {"browser_search", "browser_search_open_first"}:
+        return TemplateMaterialization()
+    if not _is_fresh_action_context(context):
+        return TemplateMaterialization()
+    query = _slot_string(gate.slots or {}, "query", "search_query", "terms")
+    if query is None:
+        return TemplateMaterialization()
+    app_name = _matching_application_for_text(query, context)
+    if app_name is None:
+        return TemplateMaterialization()
+
+    payload = json.loads(
+        json.dumps(fast_action_templates()["app_open"], ensure_ascii=False)
+    )
+    payload["goal"] = f"Open {app_name}"
+    payload["confidence"] = max(float(payload.get("confidence") or 0), gate.confidence)
+    payload["reason"] = "fresh action context prefers matching local app"
+    payload["actions"][0]["target"] = app_name
+    payload["actions"][0]["description"] = f"Open {app_name}"
+    try:
+        return TemplateMaterialization(plan=ClientActionPlan.model_validate(payload))
+    except ValidationError as exc:
+        return TemplateMaterialization(
+            issues=[
+                _issue(
+                    "invalid_app_preference_template_plan",
+                    "Fresh-context app preference produced an invalid action plan.",
+                    field="action_templates",
+                    details={"template_key": template_key, "errors": exc.errors()},
+                )
+            ]
+        )
+
+
 def required_action_names_for_gate(gate: ActionIntentGate) -> tuple[str, ...]:
     template_key = template_key_for_gate(gate)
     if template_key is None:
@@ -390,6 +431,61 @@ def _working_context_string(
 
 def _application_match_key(value: str) -> str:
     return "".join(ch for ch in value.casefold() if ch.isalnum())
+
+
+def _is_fresh_action_context(context: dict[str, Any] | None) -> bool:
+    if not isinstance(context, dict):
+        return False
+    for key in ("working_context", "latest_action_result", "latest_observation"):
+        if context.get(key):
+            return False
+    return context.get("browser_active") is not True
+
+
+def _matching_application_for_text(
+    text: str,
+    context: dict[str, Any] | None,
+) -> str | None:
+    raw = (context or {}).get("available_applications")
+    if not isinstance(raw, list):
+        return None
+    text_key = _application_match_key(text)
+    if not text_key:
+        return None
+    for item in raw:
+        if isinstance(item, str):
+            app_name = item.strip()
+            candidates = [app_name]
+        elif isinstance(item, dict):
+            name = item.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            app_name = name.strip()
+            candidates = _application_match_candidates(item)
+        else:
+            continue
+        for candidate in candidates:
+            candidate_key = _application_match_key(candidate)
+            if len(candidate_key) >= 2 and candidate_key in text_key:
+                return app_name
+    return None
+
+
+def _application_match_candidates(item: dict[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for key in ("name", "display_name", "kind"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+    for key in ("aliases", "capabilities", "categories", "keywords"):
+        value = item.get(key)
+        if isinstance(value, list):
+            candidates.extend(
+                entry.strip()
+                for entry in value
+                if isinstance(entry, str) and entry.strip()
+            )
+    return list(dict.fromkeys(candidates))
 
 
 def _valid_screenshot_region(value: Any) -> bool:
