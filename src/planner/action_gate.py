@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
+
+try:
+    import yaml
+except Exception:  # pragma: no cover - optional config dependency
+    yaml = None
+
+logger = logging.getLogger("jarvis_controller.action_gate")
 
 
 @dataclass(frozen=True)
@@ -55,8 +65,50 @@ def intent_gate_payload(gate: ActionIntentGate | None) -> dict[str, Any] | None:
     }
 
 
-def intent_gate_prompt() -> str:
-    return """You are JARVIS Action Intent Gate.
+_PROMPTS_YAML_ENV = "JARVIS_PROMPTS_YAML"
+_ACTION_INTENT_GATE_PROMPT_KEY = "action_intent_gate"
+
+
+def _default_prompts_yaml_path() -> Path:
+    return (
+        Path(__file__).resolve().parents[3]
+        / "jarvis_ai_workbench"
+        / "config"
+        / "prompts.yaml"
+    )
+
+
+def _prompts_yaml_path() -> Path:
+    env_path = os.getenv(_PROMPTS_YAML_ENV)
+    if env_path:
+        return Path(env_path)
+    return _default_prompts_yaml_path()
+
+
+def _load_prompt_from_yaml(key: str) -> str | None:
+    if yaml is None:
+        return None
+    path = _prompts_yaml_path()
+    if not path.exists():
+        return None
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as exc:
+        logger.warning("failed to load prompt yaml path=%s error=%s", path, exc)
+        return None
+
+    prompt = data.get("prompts", {}).get(key)
+    if not isinstance(prompt, dict):
+        return None
+    content = prompt.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None
+    return content
+
+
+_INTENT_GATE_PROMPT_FALLBACK = """You are JARVIS Action Intent Gate.
 Output only valid JSON. Start with { and end with }.
 Do not answer the user. Do not create actions.
 
@@ -65,6 +117,8 @@ Use should_act=false for ordinary conversation or information-only questions.
 Use should_act=false for recommendation, advice, explanation, summary,
 brainstorming, or menu suggestion requests. Do not convert those into web search
 unless the user explicitly asks to search/open a browser or operate the computer.
+Cuisine/category follow-ups after a recommendation question, such as "한식 레츠고",
+are still answer-generation requests unless paired with search/browser/open words.
 Use should_act=true for browser, app, shell, keyboard, mouse, file, clipboard,
 or screen operation requests.
 Use runtime_context.working_context only as short-term session state. It may
@@ -166,7 +220,19 @@ Example Korean recommendation no-action:
 User: 점심 메뉴 추천해줘
 {"should_act":false,"intent":"none","template_key":null,"slots":{},
 "confidence":0.95,"reason":"recommendation answer request"}
+
+Example Korean recommendation follow-up no-action:
+User: 한식 레츠고
+{"should_act":false,"intent":"none","template_key":null,"slots":{},
+"confidence":0.95,"reason":"menu recommendation follow-up"}
 """
+
+
+def intent_gate_prompt() -> str:
+    return (
+        _load_prompt_from_yaml(_ACTION_INTENT_GATE_PROMPT_KEY)
+        or _INTENT_GATE_PROMPT_FALLBACK
+    )
 
 
 def _extract_json_object_or_intent_pairs(content: str) -> dict[str, Any]:

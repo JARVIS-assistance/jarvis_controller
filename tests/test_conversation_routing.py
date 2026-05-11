@@ -16,6 +16,17 @@ def test_default_short_message_stays_realtime() -> None:
     assert decision.triggered is False
 
 
+def test_casual_lunch_recommendation_stays_realtime() -> None:
+    for message in (
+        "오늘 점심 추천해줘",
+        "오늘 한식 점심 추천해줘",
+        "한식 레츠고",
+    ):
+        decision = evaluate_conversation_mode(message)
+        assert decision.mode == ConversationMode.REALTIME
+        assert decision.triggered is False
+
+
 def test_explicit_deep_request_wins() -> None:
     decision = evaluate_conversation_mode("바로 답하지 말고 깊게 생각해서 원인 분석해줘")
     assert decision.mode == ConversationMode.DEEP

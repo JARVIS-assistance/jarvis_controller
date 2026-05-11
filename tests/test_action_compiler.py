@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from planner.action_compiler import (
     ActionCompiler,
@@ -1657,6 +1658,27 @@ def test_action_intent_gate_accepts_key_value_response(monkeypatch) -> None:
     assert gate.intent == "action"
 
 
+def test_action_intent_gate_prompt_loads_from_workbench_yaml(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    prompts_path = tmp_path / "prompts.yaml"
+    prompts_path.write_text(
+        """
+version: 1
+prompts:
+  action_intent_gate:
+    name: Action Intent Gate Prompt
+    description: test
+    content: "custom intent gate prompt"
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("JARVIS_PROMPTS_YAML", str(prompts_path))
+
+    assert _intent_gate_prompt() == "custom intent gate prompt"
+
+
 def test_action_intent_gate_prompt_guides_korean_polite_requests() -> None:
     prompt = _intent_gate_prompt()
 
@@ -1676,6 +1698,8 @@ def test_action_intent_gate_prompt_guides_korean_polite_requests() -> None:
     assert "screen.screenshot" in prompt
     assert "추천해줘" in prompt
     assert "점심 메뉴 추천해줘" in prompt
+    assert "한식 레츠고" in prompt
+    assert "menu recommendation follow-up" in prompt
     assert "recommendation answer request" in prompt
     assert "ordinary conversation" in prompt
 
