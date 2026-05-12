@@ -123,11 +123,17 @@ class CoreClient:
         )
         try:
             response = urllib.request.urlopen(request, timeout=120)
+            event_buffer: list[bytes] = []
             while True:
                 line = response.readline()
                 if not line:
+                    if event_buffer:
+                        yield b"".join(event_buffer)
                     break
-                yield line
+                event_buffer.append(line)
+                if line in {b"\n", b"\r\n"}:
+                    yield b"".join(event_buffer)
+                    event_buffer = []
             response.close()
         except urllib.error.HTTPError as exc:
             detail = self._decode_error_payload(exc)
