@@ -14,6 +14,10 @@ from jarvis_contracts import (
 
 RISKY_V2_ACTIONS = {
     "terminal.run",
+    "file.write",
+    "mouse.click",
+    "mouse.drag",
+    "clipboard.paste",
     "calendar.create",
     "calendar.update",
     "calendar.delete",
@@ -131,25 +135,25 @@ class ActionValidator:
                 )
             )
 
-        if action.name in {"app.open", "app.focus"} and _abstract_app_target(action.target):
+        if action.name in {"app.open", "app.focus", "app.close"} and _abstract_app_target(action.target):
             issues.append(
                 _issue(
                     "abstract_app_target",
-                    "app.open/app.focus require a concrete application target",
+                    "app actions require a concrete application target",
                     action_index=index,
                     action_name=action.name,
                     field="target",
                     details={"target": action.target},
                 )
             )
-        elif action.name in {"app.open", "app.focus"} and not _known_application_target(
+        elif action.name in {"app.open", "app.focus", "app.close"} and not _known_application_target(
             action.target,
             context,
         ):
             issues.append(
                 _issue(
                     "unknown_application_target",
-                    "app.open/app.focus target must match an available application name",
+                    "app action target must match an available application name",
                     action_index=index,
                     action_name=action.name,
                     field="target",
@@ -280,6 +284,18 @@ def _required_v2_args(
 
     if action.name == "browser.navigate":
         require_string("url")
+    elif action.name == "open_url":
+        url = args.get("url") or action.target or action.payload
+        if not isinstance(url, str) or not url.strip():
+            issues.append(
+                _issue(
+                    "missing_required_field",
+                    "open_url requires url",
+                    action_index=index,
+                    action_name=action.name,
+                    field="args.url",
+                )
+            )
     elif action.name == "browser.search":
         require_string("query")
     elif action.name == "browser.click":
@@ -299,7 +315,7 @@ def _required_v2_args(
             )
     elif action.name == "browser.select_result":
         require_positive_int("index")
-    elif action.name in {"app.open", "app.focus"}:
+    elif action.name in {"app.open", "app.focus", "app.close"}:
         if not isinstance(action.target, str) or not action.target.strip():
             issues.append(
                 _issue(
@@ -308,6 +324,41 @@ def _required_v2_args(
                     action_index=index,
                     action_name=action.name,
                     field="target",
+                )
+            )
+    elif action.name == "file.read":
+        path = args.get("path") or action.target or action.payload
+        if not isinstance(path, str) or not path.strip():
+            issues.append(
+                _issue(
+                    "missing_required_field",
+                    "file.read requires path",
+                    action_index=index,
+                    action_name=action.name,
+                    field="args.path",
+                )
+            )
+    elif action.name == "file.write":
+        path = args.get("path") or action.target
+        text = args.get("text") or action.payload
+        if not isinstance(path, str) or not path.strip():
+            issues.append(
+                _issue(
+                    "missing_required_field",
+                    "file.write requires path",
+                    action_index=index,
+                    action_name=action.name,
+                    field="args.path",
+                )
+            )
+        if not isinstance(text, str) or text == "":
+            issues.append(
+                _issue(
+                    "missing_required_field",
+                    "file.write requires text",
+                    action_index=index,
+                    action_name=action.name,
+                    field="args.text",
                 )
             )
     elif action.name == "keyboard.type":
@@ -372,6 +423,18 @@ def _required_v2_args(
                     field="args.command",
                 )
             )
+    elif action.name == "web_search":
+        query = args.get("query") or action.target or action.payload
+        if not isinstance(query, str) or not query.strip():
+            issues.append(
+                _issue(
+                    "missing_required_field",
+                    "web_search requires query",
+                    action_index=index,
+                    action_name=action.name,
+                    field="args.query",
+                )
+            )
     elif action.name == "calendar.create":
         for field in ("title", "start", "end"):
             require_string(field)
@@ -421,6 +484,8 @@ def _capability_candidates(name: str) -> tuple[str, ...]:
         "clipboard": ("clipboard",),
         "terminal": ("terminal",),
         "notification": ("notify", "notification"),
+        "file": ("file_read", "file_write"),
+        "web_search": ("web_search",),
         "calendar": ("calendar_control", "calendar"),
     }
     return (name, namespace, *legacy.get(namespace, ()))
@@ -443,6 +508,9 @@ def _v1_capability_candidates(
         "clipboard": ("clipboard", f"clipboard.{command}", "clipboard"),
         "terminal": ("terminal", "terminal.run", "terminal"),
         "notify": ("notification", "notification.show", "notify"),
+        "file_read": ("file", "file.read", "file_read"),
+        "file_write": ("file", "file.write", "file_write"),
+        "web_search": ("web_search",),
         "calendar_control": ("calendar", "calendar_control"),
     }
     return mapped.get(action_type, (action_type,))

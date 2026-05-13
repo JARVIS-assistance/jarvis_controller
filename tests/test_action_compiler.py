@@ -7,6 +7,7 @@ from planner.action_compiler import (
     _parse_intent_gate,
     _parse_plan,
 )
+from planner.action_templates import fast_action_templates
 
 
 def test_action_intent_gate_uses_fast_model_defaults(monkeypatch) -> None:
@@ -157,6 +158,129 @@ def test_action_compiler_stops_when_intent_gate_returns_no_action(monkeypatch) -
     assert calls == 1
 
 
+def test_action_compiler_uses_grounded_template_without_gate_confidence(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    calls = 0
+
+    def fake_post_json(url, payload, *, timeout):
+        nonlocal calls
+        calls += 1
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": True,
+                                "intent": "web_search",
+                                "template_key": "browser_search_open_first",
+                                "slots": {"query": "네이버 웹툰"},
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="브라우저 열어서 네이버 웹툰 페이지 열어줘",
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert [action.type for action in decision.actions] == [
+        "open_url",
+        "browser_control",
+    ]
+    assert calls == 1
+
+
+def test_action_compiler_normalizes_browser_search_query_from_gate(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+
+    def fake_post_json(url, payload, *, timeout):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": True,
+                                "intent": "browser.search",
+                                "template_key": "browser_search",
+                                "slots": {
+                                    "query": "브라우저를 열어 소불고기 레시피 찾아줘"
+                                },
+                                "confidence": 0.95,
+                                "reason": "search request",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="브라우저를 열어 소불고기 레시피 찾아줘",
+        context={"capabilities": ["browser.search"]},
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.actions[0].type == "open_url"
+    assert decision.actions[0].args["query"] == "소불고기 레시피"
+
+
+def test_action_compiler_does_not_plan_compile_template_free_gate(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    calls = 0
+
+    def fake_post_json(url, payload, *, timeout):
+        nonlocal calls
+        calls += 1
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": True,
+                                "intent": "none",
+                                "template_key": None,
+                                "slots": {"url": "https://example.com"},
+                                "confidence": 0.95,
+                                "reason": "unusable gate",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(message="안녕?")
+
+    assert decision is not None
+    assert decision.should_act is False
+    assert decision.execution_mode == "no_action"
+    assert decision.reason == "action gate lacked a supported template"
+    assert calls == 1
+
+
 def test_action_compiler_skips_plan_fallback_when_intent_gate_unavailable(
     monkeypatch,
 ) -> None:
@@ -179,6 +303,166 @@ def test_action_compiler_skips_plan_fallback_when_intent_gate_unavailable(
 
     assert decision is None
     assert calls == 1
+
+
+def test_ollama_intent_timeout_returns_no_action_without_plan_fallback(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "ollama_chat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_COMPILER_FALLBACK_ON_INTENT_TIMEOUT", "0")
+    calls = 0
+
+    def fake_post_json(url, payload, *, timeout):
+        nonlocal calls
+        calls += 1
+        raise TimeoutError("intent gate timeout")
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(message="안녕?")
+
+    assert decision is not None
+    assert decision.should_act is False
+    assert decision.execution_mode == "no_action"
+    assert decision.reason == "intent gate timeout"
+    assert calls == 1
+
+
+def test_ollama_intent_timeout_can_fall_back_to_plan_compiler(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "ollama_chat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_COMPILER_FALLBACK_ON_INTENT_TIMEOUT", "1")
+    calls = 0
+
+    def fake_post_json(url, payload, *, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("intent gate timeout")
+        return {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "mode": "direct",
+                        "goal": "Open browser",
+                        "confidence": 0.9,
+                        "reason": "model action",
+                        "actions": [
+                            {
+                                "name": "browser.open",
+                                "args": {},
+                                "description": "Open browser",
+                                "requires_confirm": False,
+                            }
+                        ],
+                    }
+                )
+            }
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(message="브라우저 열어줘")
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.actions[0].type == "browser"
+    assert calls == 2
+
+
+def test_ollama_intent_timeout_recovers_explicit_browser_search_template(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "ollama_chat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_COMPILER_FALLBACK_ON_INTENT_TIMEOUT", "1")
+    calls = 0
+
+    def fake_post_json(url, payload, *, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise TimeoutError("intent gate timeout")
+        return {
+            "message": {
+                "content": json.dumps(
+                    {
+                        "mode": "no_action",
+                        "goal": "No action",
+                        "confidence": 0.0,
+                        "reason": "model missed explicit browser search",
+                        "actions": [],
+                    }
+                )
+            }
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="브라우저 열어서 떡볶이 레시피 검색해줘",
+        context={"capabilities": ["browser.search"]},
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "open_url"
+    assert decision.actions[0].args["query"] == "떡볶이 레시피"
+    assert calls == 1
+
+
+def test_ollama_malformed_intent_recovers_explicit_browser_search_template(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "ollama_chat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_COMPILER_FALLBACK_ON_INTENT_UNAVAILABLE", "0")
+    calls = 0
+
+    def fake_post_json(url, payload, *, timeout):
+        nonlocal calls
+        calls += 1
+        return {"message": {"content": '{"should_act": true'}}
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="브라우저 열어서 떡볶이 레시피 검색해줘",
+        context={"capabilities": ["browser.search"]},
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "open_url"
+    assert decision.actions[0].args["query"] == "떡볶이 레시피"
+    assert calls == 1
+
+
+def test_explicit_browser_search_fallback_strips_browser_command_text(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "ollama_chat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_COMPILER_FALLBACK_ON_INTENT_UNAVAILABLE", "0")
+
+    def fake_post_json(url, payload, *, timeout):
+        raise TimeoutError("intent gate timeout")
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="브라우저를 열어 소불고기 레시피 찾아줘",
+        context={"capabilities": ["browser.search"]},
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "open_url"
+    assert decision.actions[0].args["query"] == "소불고기 레시피"
 
 
 def test_action_compiler_rechecks_low_confidence_no_action_gate(monkeypatch) -> None:
@@ -443,7 +727,7 @@ def test_action_compiler_can_use_hosted_ollama_chat(monkeypatch) -> None:
     assert decision is not None
     assert decision.should_act is True
     assert len(calls) == 2
-    assert calls[0]["url"] == "https://ollma.breakpack.cc/chat"
+    assert calls[0]["url"] == "https://ollma.breakpack.cc/api/chat"
     assert calls[0]["payload"]["model"] == "qwen2.5:1.5b"
     assert calls[1]["payload"]["model"] == "qwen2.5:7b"
     assert calls[0]["payload"]["stream"] is False
@@ -512,8 +796,46 @@ def test_ollama_chat_empty_response_retries_generate(monkeypatch) -> None:
     assert decision.actions[0].args["query"] == "네이버 웹툰"
     assert decision.actions[1].command == "select_result"
     assert len(calls) == 3
-    assert calls[1]["url"] == "https://ollma.breakpack.cc/chat"
+    assert calls[1]["url"] == "https://ollma.breakpack.cc/api/chat"
     assert calls[2]["url"] == "https://ollma.breakpack.cc/api/generate"
+
+
+def test_ollama_chat_generate_falls_back_to_wrapper_generate(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "ollama_chat")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_ENDPOINT", "https://ollma.breakpack.cc/chat")
+    calls: list[str] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append(url)
+        if url.endswith("/chat"):
+            return {"message": {"role": "assistant", "content": ""}}
+        if url.endswith("/api/generate"):
+            raise RuntimeError('HTTP 404 from action compiler: {"error":"not found"}')
+        return {
+            "response": json.dumps(
+                {
+                    "should_act": False,
+                    "intent": "none",
+                    "template_key": None,
+                    "slots": {},
+                    "confidence": 0.95,
+                    "reason": "ordinary conversation",
+                }
+            )
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    gate = ActionCompiler().compile_intent_gate(message="안녕?")
+
+    assert gate is not None
+    assert gate.should_act is False
+    assert calls == [
+        "https://ollma.breakpack.cc/chat",
+        "https://ollma.breakpack.cc/api/generate",
+        "https://ollma.breakpack.cc/generate",
+    ]
 
 
 def test_action_compiler_tries_plan_when_intent_gate_returns_invalid_text(monkeypatch) -> None:
@@ -858,6 +1180,201 @@ def test_action_compiler_uses_gate_template_after_repeated_no_action(monkeypatch
     assert len(calls) == 1
 
 
+def test_action_compiler_uses_browser_select_result_template_for_followup(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    calls: list[dict[str, object]] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append({"payload": payload, "timeout": timeout})
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": True,
+                                "intent": "browser.select_result",
+                                "template_key": "browser_select_result",
+                                "slots": {"index": 2},
+                                "confidence": 0.95,
+                                "reason": "open visible browser result",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="두번째 레시피 열어줘",
+        context={
+            "capabilities": ["browser.select_result"],
+            "working_context": {
+                "active_surface": "browser",
+                "active_browser": "https://www.google.com/search?q=소불고기+레시피",
+                "recent_actions": [
+                    {
+                        "action_type": "open_url",
+                        "args": {"query": "소불고기 레시피"},
+                    }
+                ],
+            },
+        },
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert len(decision.actions) == 1
+    assert decision.actions[0].type == "browser_control"
+    assert decision.actions[0].command == "select_result"
+    assert decision.actions[0].args == {"index": 2}
+    assert len(calls) == 1
+
+
+def test_action_compiler_does_not_trust_browser_open_gate_with_target_metadata(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    calls: list[dict[str, object]] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append({"payload": payload, "timeout": timeout})
+        if len(calls) == 1:
+            content = {
+                "should_act": True,
+                "intent": "browser.open",
+                "template_key": "browser_open",
+                "slots": {},
+                "confidence": 0.95,
+                "reason": "open browser with query",
+            }
+        else:
+            content = {
+                "mode": "direct_sequence",
+                "goal": "Open requested browser target",
+                "confidence": 0.9,
+                "reason": "compiler resolves browser target",
+                "actions": [
+                    {
+                        "name": "browser.search",
+                        "args": {"query": "네이버 웹툰"},
+                        "description": "Search browser",
+                        "requires_confirm": False,
+                    },
+                    {
+                        "name": "browser.select_result",
+                        "args": {"index": 1},
+                        "description": "Open first result",
+                        "requires_confirm": False,
+                    },
+                ],
+            }
+        return {"choices": [{"message": {"content": json.dumps(content)}}]}
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="브라우저 열어서 네이버 웹툰 페이지 열어줘",
+        context={"capabilities": ["browser.search", "browser.select_result"]},
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct_sequence"
+    assert [action.type for action in decision.actions] == ["open_url", "browser_control"]
+    assert decision.actions[0].args["query"] == "네이버 웹툰"
+    assert decision.actions[1].command == "select_result"
+    assert decision.actions[1].args == {"index": 1}
+    assert len(calls) == 2
+
+
+def test_action_compiler_maps_browser_open_url_slot_to_open_url(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    calls: list[dict[str, object]] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append({"payload": payload, "timeout": timeout})
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": True,
+                                "intent": "browser.open",
+                                "template_key": "browser_open",
+                                "slots": {
+                                    "url": "https://www.naver.com/webtoon/main.nhn"
+                                },
+                                "confidence": 0.95,
+                                "reason": "request to open browser with URL",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="브라우저 열어서 네이버 웹툰 페이지 열어줘",
+        context={"capabilities": ["open_url", "browser.open"]},
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "open_url"
+    assert decision.actions[0].target == "https://www.naver.com/webtoon/main.nhn"
+    assert len(calls) == 1
+
+
+def test_fast_action_templates_cover_frontend_config_actions() -> None:
+    templates = fast_action_templates()
+    assert {
+        "notification_show",
+        "clipboard_copy",
+        "clipboard_paste",
+        "open_url",
+        "browser_open",
+        "browser_navigate",
+        "browser_search",
+        "browser_select_result",
+        "browser_extract_dom",
+        "browser_click",
+        "browser_type",
+        "app_open",
+        "app_focus",
+        "app_close",
+        "file_read",
+        "file_write",
+        "terminal_run",
+        "screen_screenshot",
+        "mouse_click",
+        "mouse_drag",
+        "keyboard_type",
+        "keyboard_hotkey",
+        "web_search",
+    }.issubset(templates)
+    for key in {
+        "file_write",
+        "terminal_run",
+        "mouse_click",
+        "mouse_drag",
+        "clipboard_paste",
+    }:
+        assert templates[key]["actions"][0]["requires_confirm"] is True
+
+
 def test_action_compiler_prefers_matching_local_app_for_fresh_action_context(
     monkeypatch,
 ) -> None:
@@ -964,6 +1481,53 @@ def test_action_compiler_recovers_app_open_when_gate_misses_fresh_app_metadata(
     assert len(calls) == 1
 
 
+def test_action_compiler_rejects_ungrounded_app_template(monkeypatch) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+
+    def fake_post_json(url, payload, *, timeout):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": True,
+                                "intent": "app.open",
+                                "template_key": "app_open",
+                                "slots": {"app_name": "Weather"},
+                                "confidence": 0.95,
+                                "reason": "incorrect app match",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="안녕?",
+        context={
+            "capabilities": ["app.open"],
+            "available_applications": [
+                {
+                    "name": "Weather",
+                    "aliases": ["Weather", "weather", "날씨"],
+                    "capabilities": ["weather", "forecast", "날씨", "예보"],
+                    "categories": ["weather"],
+                    "keywords": ["오늘 날씨", "지역 날씨"],
+                }
+            ],
+        },
+    )
+
+    assert decision is not None
+    assert decision.should_act is False
+    assert decision.execution_mode == "no_action"
+
+
 def test_action_compiler_recovers_browser_search_for_app_followup_no_action_gate(
     monkeypatch,
 ) -> None:
@@ -1020,7 +1584,121 @@ def test_action_compiler_recovers_browser_search_for_app_followup_no_action_gate
     assert decision.should_act is True
     assert decision.execution_mode == "direct"
     assert decision.actions[0].type == "open_url"
-    assert decision.actions[0].args["query"] == "대구 지역의 날씨는 어때?"
+    assert decision.actions[0].args["query"] == "대구 지역의 날씨는 어때"
+    assert len(calls) == 1
+
+
+def test_action_compiler_reopens_active_app_for_explicit_app_open_followup(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    calls: list[dict[str, object]] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append({"payload": payload, "timeout": timeout})
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": False,
+                                "intent": "none",
+                                "confidence": 0.95,
+                                "reason": "ordinary conversation",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="날씨앱 다시 열어줘",
+        context={
+            "capabilities": ["app.open", "browser.search"],
+            "latest_action_result": {
+                "app": "Weather",
+                "command": "open",
+                "active_app": "Weather",
+                "launched_app": "Weather",
+                "bundle_id": "com.apple.weather",
+                "source": "app_control",
+            },
+            "available_applications": [
+                {
+                    "name": "Weather",
+                    "aliases": ["weather", "날씨"],
+                    "bundle_id": "com.apple.weather",
+                    "capabilities": ["weather", "forecast", "예보"],
+                    "categories": ["weather"],
+                },
+            ],
+        },
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "app_control"
+    assert decision.actions[0].command == "open"
+    assert decision.actions[0].target == "Weather"
+    assert len(calls) == 1
+
+
+def test_action_compiler_opens_korean_stocks_app_from_runtime_metadata(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    calls: list[dict[str, object]] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append({"payload": payload, "timeout": timeout})
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": False,
+                                "intent": "none",
+                                "confidence": 0.95,
+                                "reason": "ordinary conversation",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="주식앱 켜줄래?",
+        context={
+            "capabilities": ["app.open", "browser.search"],
+            "available_applications": [
+                {
+                    "name": "Stocks",
+                    "display_name": "Stocks",
+                    "bundle_id": "com.apple.stocks",
+                    "aliases": ["Stocks", "stocks"],
+                    "kind": "macos_app",
+                },
+            ],
+        },
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "app_control"
+    assert decision.actions[0].command == "open"
+    assert decision.actions[0].target == "Stocks"
     assert len(calls) == 1
 
 
@@ -1065,8 +1743,8 @@ def test_action_compiler_recovers_explicit_search_when_gate_hallucinates_app(
     assert decision.should_act is True
     assert decision.execution_mode == "direct"
     assert decision.actions[0].type == "open_url"
-    assert decision.actions[0].args["query"] == "소불고기 레시피 찾아줘"
-    assert len(calls) == 2
+    assert decision.actions[0].args["query"] == "소불고기 레시피"
+    assert len(calls) == 1
 
 
 def test_action_compiler_keeps_browser_search_when_working_context_exists(

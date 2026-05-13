@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -59,36 +60,68 @@ def complete_model_text(
 ) -> str:
     post = post_json or post_json_request
     if provider == "ollama_chat":
-        data = post(
-            _ollama_chat_url(endpoint),
-            _ollama_chat_payload(model=model, payload=payload),
-            timeout=timeout,
-        )
-        message = data.get("message")
-        content = message.get("content") if isinstance(message, dict) else None
-        if isinstance(content, str) and content.strip():
-            return content
+        last_exc: Exception | None = None
+        for url in _ollama_chat_urls(endpoint):
+            try:
+                data = post(
+                    url,
+                    _ollama_chat_payload(model=model, payload=payload),
+                    timeout=timeout,
+                )
+            except (TimeoutError, socket.timeout):
+                raise
+            except Exception as exc:
+                last_exc = exc
+                continue
+            message = data.get("message")
+            content = message.get("content") if isinstance(message, dict) else None
+            if isinstance(content, str) and content.strip():
+                return content
+            break
 
-        data = post(
-            _ollama_generate_url(endpoint),
-            _ollama_generate_payload(model=model, payload=payload),
-            timeout=timeout,
-        )
-        content = data.get("response")
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError("empty Ollama chat/generate response")
-        return content
+        for url in _ollama_generate_urls(endpoint):
+            try:
+                data = post(
+                    url,
+                    _ollama_generate_payload(model=model, payload=payload),
+                    timeout=timeout,
+                )
+            except (TimeoutError, socket.timeout):
+                raise
+            except Exception as exc:
+                last_exc = exc
+                continue
+            content = data.get("response")
+            if isinstance(content, str) and content.strip():
+                return content
+            break
+        if last_exc is not None:
+            raise ValueError(
+                f"empty Ollama chat/generate response after chat error: {last_exc}"
+            ) from last_exc
+        raise ValueError("empty Ollama chat/generate response")
 
     if provider == "ollama":
-        data = post(
-            _ollama_generate_url(endpoint),
-            _ollama_generate_payload(model=model, payload=payload),
-            timeout=timeout,
-        )
-        content = data.get("response")
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError("empty Ollama response")
-        return content
+        last_exc: Exception | None = None
+        for url in _ollama_generate_urls(endpoint):
+            try:
+                data = post(
+                    url,
+                    _ollama_generate_payload(model=model, payload=payload),
+                    timeout=timeout,
+                )
+            except (TimeoutError, socket.timeout):
+                raise
+            except Exception as exc:
+                last_exc = exc
+                continue
+            content = data.get("response")
+            if isinstance(content, str) and content.strip():
+                return content
+            break
+        if last_exc is not None:
+            raise ValueError(f"empty Ollama response after error: {last_exc}") from last_exc
+        raise ValueError("empty Ollama response")
 
     data = post(endpoint, payload, timeout=timeout)
     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
@@ -97,12 +130,12 @@ def complete_model_text(
     return content
 
 
-def _ollama_chat_url(endpoint: str) -> str:
+def _ollama_chat_urls(endpoint: str) -> list[str]:
     raw = endpoint.rstrip("/")
     path = urllib.parse.urlparse(raw).path
     if path.endswith("/chat") or path.endswith("/api/chat"):
-        return raw
-    return f"{raw}/chat"
+        return [raw]
+    return [f"{raw}/api/chat", f"{raw}/chat"]
 
 
 def _ollama_chat_payload(
@@ -110,23 +143,46 @@ def _ollama_chat_payload(
     model: str,
     payload: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
+    options = {
+        "temperature": payload.get("temperature", 0),
+        "num_predict": payload.get("max_tokens"),
+    }
+    result = {
         "model": model,
         "messages": payload.get("messages", []),
         "stream": False,
-        "options": {
-            "temperature": payload.get("temperature", 0),
-            "num_predict": payload.get("max_tokens"),
-        },
+        "options": options,
     }
+    think = payload.get("think")
+    if isinstance(think, bool):
+        result["think"] = think
+    keep_alive = os.getenv("JARVIS_ACTION_OLLAMA_KEEP_ALIVE")
+    if keep_alive:
+        result["keep_alive"] = keep_alive
+    return result
 
 
-def _ollama_generate_url(endpoint: str) -> str:
+def _ollama_generate_urls(endpoint: str) -> list[str]:
     raw = endpoint.rstrip("/")
-    path = urllib.parse.urlparse(raw).path
+    parsed = urllib.parse.urlparse(raw)
+    path = parsed.path.rstrip("/")
     if path.endswith("/api/generate"):
-        return raw
-    return f"{raw}/api/generate"
+        return [raw]
+    if path.endswith("/generate"):
+        return [raw]
+    if path.endswith("/api/chat"):
+        base = path.removesuffix("/api/chat")
+        return [
+            urllib.parse.urlunparse(parsed._replace(path=base + "/api/generate")),
+            urllib.parse.urlunparse(parsed._replace(path=base + "/generate")),
+        ]
+    if path.endswith("/chat"):
+        base = path.removesuffix("/chat")
+        return [
+            urllib.parse.urlunparse(parsed._replace(path=base + "/api/generate")),
+            urllib.parse.urlunparse(parsed._replace(path=base + "/generate")),
+        ]
+    return [f"{raw}/api/generate", f"{raw}/generate"]
 
 
 def _ollama_generate_payload(
@@ -139,15 +195,23 @@ def _ollama_generate_payload(
         for message in payload.get("messages", [])
         if isinstance(message, dict)
     )
-    return {
+    options = {
+        "temperature": payload.get("temperature", 0),
+        "num_predict": payload.get("max_tokens"),
+    }
+    result = {
         "model": model,
         "prompt": prompt,
         "stream": False,
-        "options": {
-            "temperature": payload.get("temperature", 0),
-            "num_predict": payload.get("max_tokens"),
-        },
+        "options": options,
     }
+    think = payload.get("think")
+    if isinstance(think, bool):
+        result["think"] = think
+    keep_alive = os.getenv("JARVIS_ACTION_OLLAMA_KEEP_ALIVE")
+    if keep_alive:
+        result["keep_alive"] = keep_alive
+    return result
 
 
 def post_json_request(

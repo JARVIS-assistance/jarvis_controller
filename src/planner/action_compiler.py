@@ -21,6 +21,7 @@ from planner.action_gate import (
     intent_gate_payload,
     intent_gate_prompt,
     parse_intent_gate,
+    runtime_intent_gate_prompt,
 )
 from planner.action_model_client import (
     action_compiler_model_name,
@@ -41,6 +42,7 @@ from planner.action_templates import (
     fast_action_templates,
     materialize_browser_search_for_text,
     materialize_contextual_app_followup_search_for_text,
+    materialize_explicit_app_open_for_text,
     materialize_fresh_context_app_open_for_text,
     materialize_fresh_context_app_preference,
     materialize_gate_template,
@@ -200,6 +202,15 @@ class ActionCompiler:
         provider = action_model_provider()
         timeout = _float_env("JARVIS_ACTION_INTENT_MODEL_TIMEOUT_SECONDS", 2.0)
         max_tokens = int(_float_env("JARVIS_ACTION_INTENT_MODEL_MAX_TOKENS", 192))
+        if provider.startswith("ollama"):
+            timeout = min(
+                timeout,
+                _float_env("JARVIS_ACTION_INTENT_OLLAMA_TIMEOUT_CAP_SECONDS", 1.5),
+            )
+            max_tokens = min(
+                max_tokens,
+                int(_float_env("JARVIS_ACTION_INTENT_OLLAMA_MAX_TOKENS_CAP", 64)),
+            )
         logger.info(
             "action intent gate request provider=%s endpoint=%s model=%s timeout=%.1fs message=%s",
             provider,
@@ -211,7 +222,7 @@ class ActionCompiler:
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": intent_gate_prompt()},
+                {"role": "system", "content": runtime_intent_gate_prompt()},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -253,6 +264,15 @@ class ActionCompiler:
                 timeout,
                 exc,
             )
+            if provider.startswith("ollama"):
+                return ActionIntentGate(
+                    should_act=False,
+                    intent="none",
+                    confidence=0.0,
+                    reason="intent gate timeout",
+                    template_key=None,
+                    slots={},
+                )
             return None
         except Exception as exc:
             logger.warning("action intent gate failed: %s", exc)
@@ -272,6 +292,13 @@ class ActionCompiler:
             context=context,
             latest_observation=latest_observation,
         )
+        explicit_app_open_decision = self._decision_from_explicit_app_open_text(
+            message,
+            confidence=gate.confidence if gate is not None else 0.9,
+            context=context,
+        )
+        if explicit_app_open_decision is not None:
+            return explicit_app_open_decision
         if (
             gate is not None
             and not gate.should_act
@@ -301,6 +328,50 @@ class ActionCompiler:
                 plan=None,
                 validation_errors=[],
             )
+
+        if gate is not None and gate.should_act:
+            app_preference_decision = self._decision_from_fresh_context_app_preference(
+                gate,
+                context=context,
+            )
+            if app_preference_decision is not None:
+                return app_preference_decision
+            template_decision = self._decision_from_trusted_gate_template(
+                gate,
+                message=message,
+                context=context,
+            )
+            if template_decision is not None:
+                return template_decision
+            if _gate_is_ungrounded_app_template(gate, message=message, context=context):
+                search_decision = self._decision_from_explicit_browser_search_text(
+                    message,
+                    confidence=gate.confidence,
+                    context=context,
+                )
+                if search_decision is not None:
+                    return search_decision
+                return ActionIntentDecision(
+                    should_act=False,
+                    execution_mode="no_action",
+                    intent="none",
+                    confidence=gate.confidence,
+                    reason="ungrounded app action",
+                    actions=[],
+                    plan=None,
+                    validation_errors=[],
+                )
+            if _gate_lacks_action_template(gate):
+                return ActionIntentDecision(
+                    should_act=False,
+                    execution_mode="no_action",
+                    intent="none",
+                    confidence=gate.confidence,
+                    reason="action gate lacked a supported template",
+                    actions=[],
+                    plan=None,
+                    validation_errors=[],
+                )
         if (
             gate is not None
             and gate.should_act
@@ -319,7 +390,32 @@ class ActionCompiler:
             )
             if template_decision is not None:
                 return template_decision
+            if _gate_is_ungrounded_app_template(gate, message=message, context=context):
+                search_decision = self._decision_from_explicit_browser_search_text(
+                    message,
+                    confidence=gate.confidence,
+                    context=context,
+                )
+                if search_decision is not None:
+                    return search_decision
+                return ActionIntentDecision(
+                    should_act=False,
+                    execution_mode="no_action",
+                    intent="none",
+                    confidence=gate.confidence,
+                    reason="ungrounded app action",
+                    actions=[],
+                    plan=None,
+                    validation_errors=[],
+                )
         if gate is None:
+            search_decision = self._decision_from_explicit_browser_search_text(
+                message,
+                confidence=0.0,
+                context=context,
+            )
+            if search_decision is not None:
+                return search_decision
             if (
                 not _action_compiler_fallback_on_intent_unavailable()
                 and not _has_working_context_followup_state(context)
@@ -350,8 +446,28 @@ class ActionCompiler:
             )
             if app_followup_decision is not None:
                 return app_followup_decision
+            search_decision = self._decision_from_explicit_browser_search_text(
+                message,
+                confidence=gate.confidence,
+                context=context,
+            )
+            if search_decision is not None and (
+                (
+                    _is_intent_gate_timeout(gate)
+                    and _action_compiler_fallback_on_intent_timeout()
+                )
+                or (
+                    gate.confidence < _action_intent_confidence_threshold()
+                    and _action_compiler_fallback_on_low_confidence_no_action()
+                )
+            ):
+                return search_decision
             if (
                 not _action_compiler_fallback_on_low_confidence_no_action()
+                and not (
+                    _is_intent_gate_timeout(gate)
+                    and _action_compiler_fallback_on_intent_timeout()
+                )
                 and not _has_working_context_followup_state(context)
                 and not validation_errors
             ):
@@ -365,13 +481,20 @@ class ActionCompiler:
                     plan=None,
                     validation_errors=[],
                 )
-            logger.info(
-                "action intent gate confidence below threshold; trying plan compiler "
-                "fallback confidence=%.2f threshold=%.2f message=%s",
-                gate.confidence,
-                _action_intent_confidence_threshold(),
-                message[:200],
-            )
+            if _is_intent_gate_timeout(gate):
+                logger.info(
+                    "action intent gate timed out; trying plan compiler fallback "
+                    "message=%s",
+                    message[:200],
+                )
+            else:
+                logger.info(
+                    "action intent gate confidence below threshold; trying plan compiler "
+                    "fallback confidence=%.2f threshold=%.2f message=%s",
+                    gate.confidence,
+                    _action_intent_confidence_threshold(),
+                    message[:200],
+                )
 
         if (
             gate is not None
@@ -410,6 +533,29 @@ class ActionCompiler:
                 if search_decision is not None:
                     return search_decision
             return None
+
+        if (
+            gate is not None
+            and not gate.should_act
+            and plan.mode == "no_action"
+            and (
+                (
+                    _is_intent_gate_timeout(gate)
+                    and _action_compiler_fallback_on_intent_timeout()
+                )
+                or (
+                    gate.confidence < _action_intent_confidence_threshold()
+                    and _action_compiler_fallback_on_low_confidence_no_action()
+                )
+            )
+        ):
+            search_decision = self._decision_from_explicit_browser_search_text(
+                message,
+                confidence=gate.confidence,
+                context=context,
+            )
+            if search_decision is not None:
+                return search_decision
 
         if (
             gate is not None
@@ -559,6 +705,19 @@ class ActionCompiler:
                     return template_decision
             template_completeness_error = _intent_template_completeness_issue(gate, plan)
 
+        browser_open_target_error = _browser_open_target_metadata_issue(gate, plan)
+        if browser_open_target_error is not None and max_retries > 0:
+            plan = self.compile_plan(
+                message=message,
+                context=context,
+                latest_observation=latest_observation,
+                validation_errors=[browser_open_target_error],
+                intent_gate=gate,
+            )
+            if plan is None:
+                return None
+            max_retries -= 1
+
         if (
             template_completeness_error is not None
             and gate is not None
@@ -645,6 +804,25 @@ class ActionCompiler:
         plan = materialized.plan
         if isinstance(plan, ClientActionPlan):
             logger.info("action compiler recovered app follow-up browser search")
+            return self._decision_from_plan(plan, message="", context=context)
+        return None
+
+    def _decision_from_explicit_app_open_text(
+        self,
+        text: str,
+        *,
+        confidence: float,
+        context: dict[str, Any] | None,
+    ) -> ActionIntentDecision | None:
+        materialized = materialize_explicit_app_open_for_text(
+            text,
+            confidence=confidence,
+            context=context,
+            reason="explicit app open request matched runtime app metadata",
+        )
+        plan = materialized.plan
+        if isinstance(plan, ClientActionPlan):
+            logger.info("action compiler recovered explicit app open from metadata")
             return self._decision_from_plan(plan, message="", context=context)
         return None
 
@@ -853,10 +1031,16 @@ Rules:
 - When runtime_context.available_applications is present, app targets must use an
   exact listed application name. Aliases are hints only; never emit aliases as targets.
 - Never use target "browser", "default_browser", or "web_browser" for app actions.
-- Use browser.open/browser.navigate/browser.search for browser work.
+- Use browser.open only for opening an empty browser.
+- If the user asks to open a browser and then open a page/site/target without a
+  concrete URL, use browser.search followed by browser.select_result index 1.
 - Use browser.extract_dom before browser.click/browser.type when the element id is unknown.
 - Use browser.select_result only when the user asks to open a numbered result
   already visible in current search results.
+- If runtime_context.working_context.active_surface is "browser" or
+  runtime_context.working_context.active_browser is present and the user asks to
+  open a numbered/ordinal result, use browser.select_result with args.index.
+  Do not use browser.open for that follow-up.
 - If the user asks to search for something and "go in/open it" without specifying
   a numbered result, use direct_sequence: browser.search then browser.select_result
   with args.index=1.
@@ -877,7 +1061,8 @@ Rules:
 - If validation_errors contains code intent_template_incomplete, include every
   missing action named in details.missing_actions while preserving the expected
   order in details.expected_actions.
-- terminal.run and calendar create/update/delete require requires_confirm=true.
+- terminal.run, file.write, mouse.click, mouse.drag, clipboard.paste, and calendar
+  create/update/delete require requires_confirm=true.
 - Disabled or unavailable capabilities in runtime_context must not be used.
 - Do not invent missing URLs. If only a query is known, use browser.search with args.query.
 - Prefer an action_templates entry when it fits the request. Replace placeholders
@@ -893,6 +1078,12 @@ Korean action examples:
 - "네이버 웹툰 검색해서 들어가줘" => mode direct_sequence,
   actions browser.search args {{"query":"네이버 웹툰"}}, then browser.select_result
   args {{"index":1}}.
+- "브라우저 열어서 네이버 웹툰 페이지 열어줘" => mode direct_sequence,
+  actions browser.search args {{"query":"네이버 웹툰"}}, then browser.select_result
+  args {{"index":1}}.
+- Given runtime_context.working_context.active_surface "browser" and active_browser
+  "https://www.google.com/search?q=소불고기+레시피", "두번째 레시피 열어줘" =>
+  mode direct, action browser.select_result args {{"index":2}}.
 - "Sublime Text 열어서 안녕하세요 작성해줘" => mode direct_sequence,
   actions app.open target "Sublime Text", then keyboard.type args {{"text":"안녕하세요"}}.
 - "텍스트 편집기 열어서 너의 소개 작성해줘" => mode direct_sequence,
@@ -980,6 +1171,37 @@ def _intent_template_completeness_issue(
     )
 
 
+def _browser_open_target_metadata_issue(
+    gate: ActionIntentGate | None,
+    plan: ClientActionPlan,
+) -> ClientActionValidationIssue | None:
+    if gate is None or not gate.should_act:
+        return None
+    if template_key_for_gate(gate) != "browser_open":
+        return None
+    if not _browser_open_gate_has_target_metadata(gate):
+        return None
+    if plan.mode == "no_action" or len(plan.actions) != 1:
+        return None
+    action = plan.actions[0]
+    if action.name != "browser.open":
+        return None
+    args = action.args if isinstance(action.args, dict) else {}
+    if any(args.get(key) for key in ("url", "query", "target")) or action.target:
+        return None
+    return _issue(
+        "browser_open_lost_target",
+        "Intent gate metadata says this browser.open request has a target/query. "
+        "Do not compile it as an empty browser.open action; use open_url, "
+        "browser.navigate, browser.search, or browser.search followed by "
+        "browser.select_result according to the requested target.",
+        action_index=0,
+        action_name="browser.open",
+        field="actions",
+        details=intent_gate_payload(gate),
+    )
+
+
 def _has_working_context_followup_state(context: dict[str, Any] | None) -> bool:
     working_context = (context or {}).get("working_context")
     if not isinstance(working_context, dict):
@@ -1047,6 +1269,8 @@ def _gate_template_is_grounded(
     if not gate.template_key:
         return False
     template_key = template_key_for_gate(gate)
+    if template_key == "browser_open":
+        return False
     if template_key not in {"app_open", "app_open_type"}:
         return True
     slots = gate.slots or {}
@@ -1057,12 +1281,39 @@ def _gate_template_is_grounded(
     return bool(active_app and _has_working_context_followup_state(context))
 
 
+def _gate_is_ungrounded_app_template(
+    gate: ActionIntentGate,
+    *,
+    message: str,
+    context: dict[str, Any] | None,
+) -> bool:
+    if not gate.should_act:
+        return False
+    if template_key_for_gate(gate) not in {"app_open", "app_open_type"}:
+        return False
+    return not _gate_template_is_grounded(gate, message=message, context=context)
+
+
+def _gate_lacks_action_template(gate: ActionIntentGate) -> bool:
+    if not gate.should_act:
+        return False
+    return template_key_for_gate(gate) is None
+
+
 def _slot_text(slots: dict[str, Any], *names: str) -> str | None:
     for name in names:
         value = slots.get(name)
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def _browser_open_gate_has_target_metadata(gate: ActionIntentGate) -> bool:
+    slots = gate.slots if isinstance(gate.slots, dict) else {}
+    if any(key in slots for key in ("query", "search_query", "terms", "url", "target")):
+        return True
+    reason = gate.reason.casefold() if isinstance(gate.reason, str) else ""
+    return any(token in reason for token in ("query", "url", "target", "page", "search"))
 
 
 def _missing_ordered_action_names(
@@ -1230,6 +1481,23 @@ def _action_compiler_fallback_on_low_confidence_no_action() -> bool:
         "0",
     ).lower()
     return raw in {"1", "true", "yes", "on"}
+
+
+def _action_compiler_fallback_on_intent_timeout() -> bool:
+    raw = os.getenv(
+        "JARVIS_ACTION_COMPILER_FALLBACK_ON_INTENT_TIMEOUT",
+        "1",
+    ).lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _is_intent_gate_timeout(gate: ActionIntentGate | None) -> bool:
+    return (
+        gate is not None
+        and not gate.should_act
+        and gate.confidence <= 0
+        and gate.reason == "intent gate timeout"
+    )
 
 
 def _issue(

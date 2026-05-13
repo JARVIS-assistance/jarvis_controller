@@ -11,6 +11,7 @@ from jarvis_contracts import (
     ClientActionValidationIssue,
 )
 
+from planner.action_templates import normalize_browser_search_query
 from planner.action_validator import ActionValidator
 
 
@@ -63,6 +64,7 @@ class V2ToV1ActionAdapter:
             query = _string_arg(args, "query")
             if query is None:
                 return _issue("missing_query", "browser.search requires args.query", index, action)
+            query = normalize_browser_search_query(query)
             url = _search_url(query, context=context)
             return ClientAction(
                 type="open_url",
@@ -157,8 +159,12 @@ class V2ToV1ActionAdapter:
                 step_id=action.step_id,
             )
 
-        if action.name in {"app.open", "app.focus"}:
-            command = "open" if action.name == "app.open" else "focus"
+        if action.name in {"app.open", "app.focus", "app.close"}:
+            command = {
+                "app.open": "open",
+                "app.focus": "focus",
+                "app.close": "close",
+            }[action.name]
             return ClientAction(
                 type="app_control",
                 command=command,
@@ -166,6 +172,48 @@ class V2ToV1ActionAdapter:
                 args=dict(args),
                 description=action.description or f"{command} {action.target}",
                 requires_confirm=action.requires_confirm,
+                step_id=action.step_id,
+            )
+
+        if action.name == "open_url":
+            url = _string_arg(args, "url") or action.target or action.payload
+            return ClientAction(
+                type="open_url",
+                command=None,
+                target=url,
+                args={key: value for key, value in args.items() if key != "url"},
+                description=action.description or "Open URL",
+                requires_confirm=action.requires_confirm,
+                step_id=action.step_id,
+            )
+
+        if action.name == "file.read":
+            path = _string_arg(args, "path") or action.target or action.payload
+            return ClientAction(
+                type="file_read",
+                command=None,
+                target=path,
+                args={key: value for key, value in args.items() if key != "path"},
+                description=action.description or "Read file",
+                requires_confirm=action.requires_confirm,
+                step_id=action.step_id,
+            )
+
+        if action.name == "file.write":
+            path = _string_arg(args, "path") or action.target
+            text = _string_arg(args, "text") or action.payload
+            return ClientAction(
+                type="file_write",
+                command=None,
+                target=path,
+                payload=text,
+                args={
+                    key: value
+                    for key, value in args.items()
+                    if key not in {"path", "text"}
+                },
+                description=action.description or "Write file",
+                requires_confirm=True,
                 step_id=action.step_id,
             )
 
@@ -262,6 +310,18 @@ class V2ToV1ActionAdapter:
                 payload=_string_arg(args, "text") or action.payload,
                 args={key: value for key, value in args.items() if key != "text"},
                 description=action.description or "Show notification",
+                requires_confirm=action.requires_confirm,
+                step_id=action.step_id,
+            )
+
+        if action.name == "web_search":
+            query = _string_arg(args, "query") or action.target or action.payload
+            return ClientAction(
+                type="web_search",
+                command=None,
+                target=query,
+                args={key: value for key, value in args.items() if key != "query"},
+                description=action.description or "Web search",
                 requires_confirm=action.requires_confirm,
                 step_id=action.step_id,
             )

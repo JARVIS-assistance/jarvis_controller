@@ -149,10 +149,32 @@ current user request. Supported template_key values:
 - browser_search_open_first: search and open a result; slots.query is required
   and slots.open_result_index should be 1 unless the user specifies another
   visible result number.
+- browser_select_result: open an already visible browser search result;
+  slots.index is required. Use this for follow-up requests such as opening the
+  second/third result after a previous browser search.
+- open_url or browser_navigate: open a concrete URL; slots.url is required.
+- browser_extract_dom: inspect the active browser page when an element id is
+  needed before click/type.
+- browser_click: click a known browser DOM element; slots.ai_id is required.
+- browser_type: type into a known browser DOM element; slots.ai_id and
+  slots.text are required.
 - app_open: open a local application; slots.app_name is required.
 - app_open_type: open a local application and type text; slots.app_name and
   slots.text are required.
+- app_focus or app_close: focus or close a local app; slots.app_name is required.
+- file_read: read a file; slots.path is required.
+- file_write: write a file; slots.path and slots.text are required and
+  confirmation is required.
+- terminal_run: run a terminal command; slots.command is required and
+  confirmation is required.
 - screen_screenshot: capture the current screen.
+- mouse_click or mouse_drag: use screen coordinates; confirmation is required.
+- keyboard_type or keyboard_hotkey: type text or press a shortcut.
+- clipboard_copy or clipboard_paste: copy text or paste; paste requires
+  confirmation.
+- notification_show: show a notification; slots.text is required.
+- web_search: run server-side web search without opening the browser;
+  slots.query is required.
 
 If should_act=false, use template_key=null and slots={}.
 Never leave required slots empty for should_act=true.
@@ -180,6 +202,22 @@ User: 네이버웹툰 검색해서 들어가 줘
 "template_key":"browser_search_open_first",
 "slots":{"query":"네이버웹툰","open_result_index":1},
 "confidence":0.95,"reason":"search and open first result"}
+
+Example Korean browser page action:
+User: 브라우저 열어서 네이버 웹툰 페이지 열어줘
+{"should_act":true,"intent":"browser.search+browser.select_result",
+"template_key":"browser_search_open_first",
+"slots":{"query":"네이버 웹툰","open_result_index":1},
+"confidence":0.95,"reason":"open requested browser page"}
+
+Example browser result follow-up action:
+runtime_context.working_context.active_surface: "browser"
+runtime_context.working_context.active_browser: "https://www.google.com/search?q=소불고기+레시피"
+User: 두번째 레시피 열어줘
+{"should_act":true,"intent":"browser.select_result",
+"template_key":"browser_select_result",
+"slots":{"index":2},
+"confidence":0.95,"reason":"open visible browser result"}
 
 Example Korean app input action:
 User: sublimetext켜서 안녕하세요 작성해볼래?
@@ -233,6 +271,10 @@ _INTENT_GATE_POLICY_OVERLAY = """Fresh-context app priority:
   available_applications contain an app that matches the user's requested task
   by app name, alias, or clear task/domain fit, prefer template_key=app_open
   over browser_search. Use the exact available app name in slots.app_name.
+- Treat current/local/live information requests as app-open candidates when an
+  installed app advertises a matching capability, category, keyword, or alias.
+  The frontend supplies those app facts; infer from runtime_context rather than
+  from a hardcoded intent table.
 - Do not invent unavailable apps. If no available app matches, keep the normal
   browser/search/no-action rules.
 
@@ -241,7 +283,86 @@ Working-context follow-up routing:
   more specific current information related to that surface, use browser_search
   when the supported templates do not provide a direct app-specific operation.
 - Do not reopen the same app just because it is active in working_context.
+- If working_context.active_surface is "browser" or working_context.active_browser
+  is present and the user asks to open a numbered/ordinal result from the current
+  page, choose template_key=browser_select_result with slots.index. Do not choose
+  browser_open for this case.
+
+Frontend-supported action templates:
+- notification_show, clipboard_copy, clipboard_paste, open_url,
+  browser_open, browser_navigate, browser_search, browser_select_result,
+  browser_extract_dom, browser_click, browser_type, app_open, app_focus,
+  app_close, file_read, file_write, terminal_run, screen_screenshot,
+  mouse_click, mouse_drag, keyboard_type, keyboard_hotkey, web_search.
+- terminal_run, file_write, mouse_click, mouse_drag, and clipboard_paste require
+  confirmation.
 """
+
+
+_INTENT_GATE_COMPACT_PROMPT = """You are JARVIS Action Intent Gate.
+Return only one JSON object:
+{"should_act":bool,"intent":string,"template_key":string|null,"slots":object,"confidence":number,"reason":string}
+
+Decide whether the latest user message asks JARVIS to operate the local computer.
+Use runtime_context as the source of truth for available apps and capabilities.
+
+Action rules:
+- Judge only the latest user message and the supplied runtime_context. Do not
+  reuse examples, prior guesses, or unrelated app facts.
+- Highest priority: greetings, thanks, casual chat, recommendations,
+  explanations, and ordinary information-only questions are no_action even when
+  runtime_context lists available apps.
+- If the message asks to open/focus/close an app, browse/search/open a page,
+  click/type/press keys, use clipboard, read/write files, run terminal, or
+  capture the screen, should_act=true.
+- Fresh-context app priority: when there is no working_context and an installed
+  app in runtime_context.available_applications matches the user's requested task
+  by name, alias, capability, category, keyword, or clear domain fit, choose
+  template_key=app_open and slots.app_name=<exact available app name>.
+- Current/local/live information requests are app-open candidates when an
+  installed app advertises a matching capability/category/keyword/alias. Infer
+  from runtime_context app facts, not from a hardcoded intent table.
+- If working_context shows an active/recent app and the user asks for more
+  specific current information related to that surface, choose browser_search
+  with slots.query instead of reopening the same app.
+- If the active browser has visible search results and the user asks for a
+  numbered result, choose browser_select_result with slots.index. The index must
+  match the user's ordinal number, not a default first result.
+
+Template keys:
+browser_open, browser_search, browser_search_open_first, browser_select_result,
+open_url, browser_navigate, browser_extract_dom, browser_click, browser_type,
+app_open, app_open_type, app_focus, app_close, file_read, file_write,
+terminal_run, screen_screenshot, mouse_click, mouse_drag, keyboard_type,
+keyboard_hotkey, clipboard_copy, clipboard_paste, notification_show, web_search.
+
+Required slots:
+app_* needs slots.app_name. browser_search/web_search needs slots.query.
+browser_select_result needs slots.index. open_url/browser_navigate needs slots.url.
+app_open_type/browser_type/keyboard_type/file_write needs slots.text.
+
+If should_act=false, use intent="none", template_key=null, slots={}.
+If should_act=true, template_key must be one supported template and all required
+slots must be present. Otherwise return should_act=false.
+Never invent unavailable apps or unsupported template keys.
+
+Examples:
+User: 안녕?
+{"should_act":false,"intent":"none","template_key":null,"slots":{},"confidence":0.95,"reason":"ordinary conversation"}
+User: 두번째 결과 열어줘
+{"should_act":true,"intent":"browser.select_result","template_key":"browser_select_result","slots":{"index":2},"confidence":0.95,"reason":"open visible browser result"}
+User: 세번째 결과 열어줘
+{"should_act":true,"intent":"browser.select_result","template_key":"browser_select_result","slots":{"index":3},"confidence":0.95,"reason":"open visible browser result"}
+"""
+
+
+def runtime_intent_gate_prompt() -> str:
+    if os.getenv(_PROMPTS_YAML_ENV):
+        return intent_gate_prompt()
+    raw = os.getenv("JARVIS_ACTION_INTENT_COMPACT_PROMPT", "1").strip().lower()
+    if raw in {"0", "false", "no"}:
+        return intent_gate_prompt()
+    return _INTENT_GATE_COMPACT_PROMPT
 
 
 def intent_gate_prompt() -> str:

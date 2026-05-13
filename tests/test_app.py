@@ -568,6 +568,131 @@ def test_fast_direct_action_runs_after_realtime_starts(monkeypatch) -> None:
     assert body.index("진행하겠습니다!") < body.index("event: action_dispatch")
 
 
+def test_action_candidate_waits_past_short_done_grace(monkeypatch) -> None:
+    from planner.action_intent_classifier import ActionIntentDecision
+
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_DONE_GRACE_SECONDS", "0.01")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_DONE_GRACE_CAP_SECONDS", "0.01")
+    monkeypatch.setenv("JARVIS_ACTION_CANDIDATE_WAIT_SECONDS", "0.5")
+    monkeypatch.setenv("JARVIS_ACTION_CANDIDATE_WAIT_CAP_SECONDS", "0.5")
+
+    action = ClientAction(
+        type="app_control",
+        command="open",
+        target="Sublime Text",
+        args={},
+        description="Open app",
+        requires_confirm=False,
+    )
+
+    def slow_action(*args, **kwargs):
+        time.sleep(0.12)
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="app.open",
+            confidence=0.9,
+            reason="model action",
+            actions=[action],
+        )
+
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        slow_action,
+    )
+
+    original_chat_stream = stub_core_client.chat_stream
+
+    def fast_done_stream(**kwargs):
+        yield b'event: assistant_delta\ndata: {"content":"stub "}\n\n'
+        yield b'event: assistant_done\ndata: {"content":"stub response"}\n\n'
+
+    class CompletedDispatcher:
+        context_store = None
+
+        def enqueue(self, *, user_id, request_id, action):
+            return ClientActionEnvelope(
+                action_id="act_candidate_wait",
+                request_id=request_id,
+                action=action,
+            )
+
+        def wait_for_result(self, *, action_id, request_id, timeout_seconds=None):
+            return ClientActionResult(
+                action_id=action_id,
+                request_id=request_id,
+                status="completed",
+                output={"ok": True},
+            )
+
+    stub_core_client.chat_stream = fast_done_stream
+    original_dispatcher = client.app.state.action_dispatcher
+    client.app.state.action_dispatcher = CompletedDispatcher()
+    try:
+        response = client.post(
+            "/conversation/stream",
+            json={"message": "앱에서 sublimetext 켜줘"},
+            headers=auth_headers(),
+        )
+    finally:
+        stub_core_client.chat_stream = original_chat_stream
+        client.app.state.action_dispatcher = original_dispatcher
+
+    assert response.status_code == 200
+    body = response.text
+    assert "event: action_dispatch" in body
+    assert "event: assistant_done" in body
+    assert body.index("event: action_dispatch") < body.index("event: assistant_done")
+
+
+def test_local_browser_search_template_removes_action_framing(monkeypatch) -> None:
+    def fail_if_model_called(*args, **kwargs):
+        raise AssertionError("local browser search template should bypass model")
+
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        fail_if_model_called,
+    )
+
+    class CompletedDispatcher:
+        context_store = None
+
+        def enqueue(self, *, user_id, request_id, action):
+            return ClientActionEnvelope(
+                action_id="act_local_search",
+                request_id=request_id,
+                action=action,
+            )
+
+        def wait_for_result(self, *, action_id, request_id, timeout_seconds=None):
+            return ClientActionResult(
+                action_id=action_id,
+                request_id=request_id,
+                status="completed",
+                output={"ok": True},
+            )
+
+    original_dispatcher = client.app.state.action_dispatcher
+    client.app.state.action_dispatcher = CompletedDispatcher()
+    try:
+        response = client.post(
+            "/conversation/stream",
+            json={"message": "브라우저 열어서 소불고기 레시피 검색해줘"},
+            headers=auth_headers(),
+        )
+    finally:
+        client.app.state.action_dispatcher = original_dispatcher
+
+    assert response.status_code == 200
+    events = _collect_events(response.text)
+    dispatches = [payload for event, payload in events if event == "action_dispatch"]
+    assert dispatches
+    action = dispatches[0]["action"]
+    assert action["type"] == "open_url"
+    assert action["args"]["query"] == "소불고기 레시피"
+    assert "브라우저" not in action["target"]
+
+
 def test_direct_action_ready_at_done_emits_before_assistant_done(monkeypatch) -> None:
     from planner.action_intent_classifier import ActionIntentDecision
 
@@ -643,6 +768,84 @@ def test_direct_action_ready_at_done_emits_before_assistant_done(monkeypatch) ->
     assert "진행하겠습니다!" in body
     assert body.index("진행하겠습니다!") < body.index("event: action_dispatch")
     assert body.index("event: action_dispatch") < body.index("event: assistant_done")
+
+
+def test_action_ack_done_waits_for_recovery_dispatch(monkeypatch) -> None:
+    from planner.action_intent_classifier import ActionIntentDecision
+
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_DONE_GRACE_SECONDS", "0.01")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_DONE_GRACE_CAP_SECONDS", "0.01")
+    monkeypatch.setenv("JARVIS_ACTION_ACK_RECOVERY_GRACE_SECONDS", "0.5")
+    monkeypatch.setenv("JARVIS_ACTION_ACK_RECOVERY_GRACE_CAP_SECONDS", "0.5")
+
+    action = ClientAction(
+        type="browser",
+        command="open",
+        target=None,
+        args={"browser": "chrome"},
+        description="Open browser",
+        requires_confirm=False,
+    )
+
+    def slow_action(*args, **kwargs):
+        time.sleep(0.12)
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="browser",
+            confidence=0.95,
+            reason="model action",
+            actions=[action],
+        )
+
+    monkeypatch.setattr(
+        "router.router.classify_client_action_intent_decision",
+        slow_action,
+    )
+
+    original_chat_stream = stub_core_client.chat_stream
+
+    def ack_only_stream(**kwargs):
+        yield 'event: assistant_delta\ndata: {"content":"진행하겠습니다!"}\n\n'.encode()
+        yield 'event: assistant_done\ndata: {"content":"진행하겠습니다!"}\n\n'.encode()
+
+    class CompletedDispatcher:
+        context_store = None
+
+        def enqueue(self, *, user_id, request_id, action):
+            return ClientActionEnvelope(
+                action_id="act_ack_recovered",
+                request_id=request_id,
+                action=action,
+            )
+
+        def wait_for_result(self, *, action_id, request_id, timeout_seconds=None):
+            return ClientActionResult(
+                action_id=action_id,
+                request_id=request_id,
+                status="completed",
+                output={"ok": True},
+            )
+
+    stub_core_client.chat_stream = ack_only_stream
+    original_dispatcher = client.app.state.action_dispatcher
+    client.app.state.action_dispatcher = CompletedDispatcher()
+    try:
+        response = client.post(
+            "/conversation/stream",
+            json={"message": "브라우저 열어줘"},
+            headers=auth_headers(),
+        )
+    finally:
+        stub_core_client.chat_stream = original_chat_stream
+        client.app.state.action_dispatcher = original_dispatcher
+
+    assert response.status_code == 200
+    body = response.text
+    assert "event: action_dispatch" in body
+    assert "action_decision_timeout" not in body
+    assert body.count("진행하겠습니다!") == 1
+    assert body.index("진행하겠습니다!") < body.index("event: action_dispatch")
 
 
 def test_stream_realtime_emits_text_plan_step_progress(monkeypatch) -> None:
@@ -1298,6 +1501,369 @@ def test_action_context_trims_large_application_list_to_app_metadata_match() -> 
         }
     ]
     assert trimmed["available_application_names"] == ["Weather"]
+
+
+def test_weather_question_opens_weather_app_first() -> None:
+    from router.router import _local_direct_action_decision
+
+    context = {
+        "capabilities": ["app.open", "browser.search"],
+        "available_applications": [
+            {
+                "name": "Weather",
+                "aliases": ["weather", "날씨"],
+                "bundle_id": "com.apple.weather",
+                "capabilities": ["weather", "forecast", "예보"],
+            }
+        ],
+    }
+
+    decision = _local_direct_action_decision("오늘 날씨 알려줘", context=context)
+
+    assert decision is not None
+    assert decision.intent == "app.open"
+    assert decision.actions[0].type == "app_control"
+    assert decision.actions[0].command == "open"
+    assert decision.actions[0].target == "Weather"
+
+
+def test_weather_question_does_not_reopen_active_weather_app() -> None:
+    from router.router import _local_direct_action_decision
+
+    context = {
+        "capabilities": ["app.open", "browser.search"],
+        "latest_action_result": {
+            "active_app": "Weather",
+            "bundle_id": "com.apple.weather",
+        },
+        "available_applications": [{"name": "Weather", "aliases": ["weather", "날씨"]}],
+    }
+
+    assert _local_direct_action_decision("대구 날씨 알려줘", context=context) is None
+
+
+def test_weather_app_reopen_request_opens_active_weather_app() -> None:
+    from router.router import _local_direct_action_decision
+
+    context = {
+        "capabilities": ["app.open", "browser.search"],
+        "latest_action_result": {
+            "active_app": "Weather",
+            "bundle_id": "com.apple.weather",
+        },
+        "available_applications": [
+            {
+                "name": "Weather",
+                "aliases": ["weather", "날씨"],
+                "bundle_id": "com.apple.weather",
+                "capabilities": ["weather", "forecast"],
+            }
+        ],
+    }
+
+    decision = _local_direct_action_decision("날씨앱 다시 켜줘", context=context)
+
+    assert decision is not None
+    assert decision.intent == "app.open"
+    assert decision.actions[0].type == "app_control"
+    assert decision.actions[0].command == "open"
+    assert decision.actions[0].target == "Weather"
+
+
+def test_weather_app_open_request_opens_active_weather_app() -> None:
+    from router.router import _local_direct_action_decision
+
+    context = {
+        "capabilities": ["app.open", "browser.search"],
+        "working_context": {
+            "active_app": "Weather",
+            "bundle_id": "com.apple.weather",
+        },
+        "available_applications": [{"name": "Weather", "aliases": ["weather", "날씨"]}],
+    }
+
+    decision = _local_direct_action_decision("날씨 앱 열어줘", context=context)
+
+    assert decision is not None
+    assert decision.intent == "app.open"
+    assert decision.actions[0].target == "Weather"
+
+
+def test_korean_stocks_app_request_opens_runtime_stocks_app() -> None:
+    from router.router import _local_direct_action_decision, _runtime_applications_for_context
+
+    applications = _runtime_applications_for_context(
+        [
+            {
+                "name": "Stocks",
+                "display_name": "Stocks",
+                "bundle_id": "com.apple.stocks",
+                "aliases": ["Stocks", "stocks"],
+                "kind": "macos_app",
+            }
+        ]
+    )
+    context = {
+        "capabilities": ["app.open", "browser.search"],
+        "available_applications": applications,
+    }
+
+    decision = _local_direct_action_decision("주식앱 켜줄래?", context=context)
+
+    assert decision is not None
+    assert decision.intent == "app.open"
+    assert decision.actions[0].type == "app_control"
+    assert decision.actions[0].command == "open"
+    assert decision.actions[0].target == "Stocks"
+
+
+def test_local_laptop_app_reference_opens_runtime_stocks_app() -> None:
+    from router.router import _local_direct_action_decision, _runtime_applications_for_context
+
+    applications = _runtime_applications_for_context(
+        [
+            {
+                "name": "Stocks",
+                "display_name": "Stocks",
+                "bundle_id": "com.apple.stocks",
+                "aliases": ["Stocks", "stocks"],
+                "kind": "macos_app",
+            }
+        ]
+    )
+    context = {
+        "capabilities": ["app.open", "browser.search"],
+        "available_applications": applications,
+    }
+
+    decision = _local_direct_action_decision("내 노트북의 주식앱", context=context)
+
+    assert decision is not None
+    assert decision.intent == "app.open"
+    assert decision.actions[0].target == "Stocks"
+
+
+def test_action_context_trims_stocks_app_by_korean_runtime_alias() -> None:
+    from router.router import _runtime_applications_for_context, _trim_action_context_for_message
+
+    applications = _runtime_applications_for_context(
+        [
+            {
+                "name": "Stocks",
+                "display_name": "Stocks",
+                "bundle_id": "com.apple.stocks",
+                "aliases": ["Stocks", "stocks"],
+                "kind": "macos_app",
+            },
+            *[{"name": f"App {index}"} for index in range(40)],
+        ]
+    )
+    context = {
+        "available_applications": applications,
+        "available_application_names": [app["name"] for app in applications],
+    }
+
+    trimmed = _trim_action_context_for_message(context, "주식앱 켜줄래?")
+
+    assert trimmed is not None
+    assert trimmed["available_application_names"] == ["Stocks"]
+    assert trimmed["available_applications"][0]["name"] == "Stocks"
+
+
+def test_runtime_application_request_preserves_routing_metadata() -> None:
+    from router.router import RuntimeApplicationRequest
+
+    app = RuntimeApplicationRequest.model_validate(
+        {
+            "name": "Stocks",
+            "aliases": ["주식"],
+            "capabilities": ["stocks"],
+            "categories": ["finance"],
+            "keywords": ["주식 시세"],
+        }
+    )
+
+    dumped = app.model_dump()
+
+    assert dumped["aliases"] == ["주식"]
+    assert dumped["capabilities"] == ["stocks"]
+    assert dumped["categories"] == ["finance"]
+    assert dumped["keywords"] == ["주식 시세"]
+
+
+def test_runtime_terminal_request_preserves_policy_metadata() -> None:
+    from router.router import TerminalProfileRequest
+
+    terminal = TerminalProfileRequest.model_validate(
+        {
+            "enabled": True,
+            "shell": "zsh",
+            "cwd": "/Users/chawonje/Desktop/Workspace/project/JARVIS",
+            "allowed_commands": ["echo", "pwd", "ls", "git status"],
+            "allowed_cwds": ["/Users/chawonje/Desktop/Workspace/project/JARVIS"],
+            "timeout_seconds": 20,
+        }
+    )
+
+    dumped = terminal.model_dump()
+
+    assert dumped["enabled"] is True
+    assert dumped["allowed_commands"] == ["echo", "pwd", "ls", "git status"]
+    assert dumped["allowed_cwds"] == ["/Users/chawonje/Desktop/Workspace/project/JARVIS"]
+
+
+def test_terminal_run_request_dispatches_confirmed_terminal_action() -> None:
+    from router.router import _local_direct_action_decision
+
+    context = {
+        "capabilities": ["terminal.run"],
+        "terminal": {
+            "enabled": True,
+            "shell": "zsh",
+            "cwd": "/Users/chawonje/Desktop/Workspace/project/JARVIS",
+            "allowed_commands": ["echo", "pwd", "ls", "git status"],
+            "allowed_cwds": ["/Users/chawonje/Desktop/Workspace/project/JARVIS"],
+            "timeout_seconds": 20,
+        },
+    }
+
+    decision = _local_direct_action_decision(
+        "터미널에서 git status 실행해줘",
+        context=context,
+    )
+
+    assert decision is not None
+    assert decision.intent == "terminal.run"
+    action = decision.actions[0]
+    assert action.type == "terminal"
+    assert action.command == "execute"
+    assert action.payload == "git status"
+    assert action.args["command"] == "git status"
+    assert action.args["cwd"] == "/Users/chawonje/Desktop/Workspace/project/JARVIS"
+    assert action.args["timeout"] == 20
+    assert action.requires_confirm is True
+
+
+def test_terminal_run_request_respects_disabled_terminal_context() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "터미널에서 pwd 실행해줘",
+        context={
+            "capabilities": ["terminal.run"],
+            "terminal": {"enabled": False, "allowed_commands": ["pwd"]},
+        },
+    )
+
+    assert decision is None
+
+
+def test_runtime_profile_llm_enrichment_adds_app_aliases(monkeypatch) -> None:
+    from planner.runtime_profile_enricher import enrich_runtime_profile_applications
+
+    monkeypatch.setenv("JARVIS_RUNTIME_PROFILE_LLM_ENRICH_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_RUNTIME_PROFILE_LLM_CHUNK_SIZE", "10")
+    calls: list[dict[str, object]] = []
+
+    def fake_complete_model_text(**kwargs):
+        calls.append(kwargs)
+        return (
+            '{"applications":[{"index":0,"aliases":["계산기"],'
+            '"capabilities":["calculator"],"categories":["utility"],'
+            '"keywords":["계산"]}]}'
+        )
+
+    monkeypatch.setattr(
+        "planner.runtime_profile_enricher.complete_model_text",
+        fake_complete_model_text,
+    )
+
+    profile = enrich_runtime_profile_applications(
+        {
+            "platform": "macos",
+            "applications": [
+                {
+                    "name": "Calculator",
+                    "display_name": "Calculator",
+                    "bundle_id": "com.apple.calculator",
+                    "aliases": ["Calculator"],
+                }
+            ],
+            "metadata": {},
+        }
+    )
+
+    app = profile["applications"][0]
+    assert "계산기" in app["aliases"]
+    assert "calculator" in app["capabilities"]
+    assert profile["metadata"]["app_enrichment"]["source"] == "llm"
+    assert calls[0]["payload"]["think"] is False
+
+
+def test_runtime_profile_llm_enrichment_accepts_nested_list_response(
+    monkeypatch,
+) -> None:
+    from planner.runtime_profile_enricher import enrich_runtime_profile_applications
+
+    monkeypatch.setenv("JARVIS_RUNTIME_PROFILE_LLM_ENRICH_ENABLED", "1")
+
+    def fake_complete_model_text(**kwargs):
+        return (
+            "["
+            '{"applications":[{"index":0,"aliases":["계산기"],'
+            '"capabilities":["calculator"]}]},'
+            '{"applications":[{"index":1,"aliases":["메모"],'
+            '"capabilities":["notes"]}]}'
+            "]"
+        )
+
+    monkeypatch.setattr(
+        "planner.runtime_profile_enricher.complete_model_text",
+        fake_complete_model_text,
+    )
+
+    profile = enrich_runtime_profile_applications(
+        {
+            "platform": "macos",
+            "applications": [
+                {"name": "Calculator", "aliases": ["Calculator"]},
+                {"name": "Notes", "aliases": ["Notes"]},
+            ],
+            "metadata": {},
+        }
+    )
+
+    assert "계산기" in profile["applications"][0]["aliases"]
+    assert "메모" in profile["applications"][1]["aliases"]
+    assert profile["metadata"]["app_enrichment"]["llm_succeeded"] is True
+
+
+def test_runtime_profile_enrichment_keeps_builtin_alias_when_llm_disabled(
+    monkeypatch,
+) -> None:
+    from planner.runtime_profile_enricher import enrich_runtime_profile_applications
+
+    monkeypatch.setenv("JARVIS_RUNTIME_PROFILE_LLM_ENRICH_ENABLED", "0")
+
+    profile = enrich_runtime_profile_applications(
+        {
+            "platform": "macos",
+            "applications": [
+                {
+                    "name": "Stocks",
+                    "display_name": "Stocks",
+                    "bundle_id": "com.apple.stocks",
+                    "aliases": ["Stocks", "stocks"],
+                }
+            ],
+            "metadata": {},
+        }
+    )
+
+    app = profile["applications"][0]
+    assert "주식" in app["aliases"]
+    assert "finance" in app["capabilities"]
+    assert profile["metadata"]["app_enrichment"]["source"] == "builtin"
 
 
 def test_stream_can_disable_core_action_fallback(monkeypatch) -> None:

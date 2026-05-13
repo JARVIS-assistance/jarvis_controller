@@ -2,8 +2,10 @@ import concurrent.futures
 import json
 import logging
 import os
+import re
 from collections.abc import Generator
 from typing import Annotated, Any, Literal, Optional
+from urllib.parse import quote_plus
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -50,6 +52,7 @@ from planner.action_pipeline import (
 from planner.action_pipeline import (
     stream_dispatched_actions as _stream_dispatched_actions,
 )
+from planner.action_templates import normalize_browser_search_query
 from planner.conversation_orchestrator import orchestrate_conversation_turn
 from planner.conversation_routing import (
     ConversationContext,
@@ -59,6 +62,7 @@ from planner.conversation_routing import (
 )
 from planner.executor import SUPPORTED_ACTIONS, run_execute, run_verify
 from planner.planning_engine import build_plan
+from planner.runtime_profile_enricher import enrich_runtime_profile_applications
 
 logger = logging.getLogger("jarvis_controller")
 
@@ -68,7 +72,11 @@ _ACTION_ARBITRATION_BUFFER_SECONDS = "JARVIS_ACTION_ARBITRATION_BUFFER_SECONDS"
 _ACTION_ARBITRATION_DEFAULT_SECONDS = 0.0
 _ACTION_INTENT_CORE_FALLBACK_ENABLED = "JARVIS_ACTION_INTENT_CORE_FALLBACK_ENABLED"
 _ACTION_INTENT_DONE_GRACE_SECONDS = "JARVIS_ACTION_INTENT_DONE_GRACE_SECONDS"
-_ACTION_INTENT_DONE_GRACE_DEFAULT_SECONDS = 22.0
+_ACTION_INTENT_DONE_GRACE_DEFAULT_SECONDS = 0.8
+_ACTION_CANDIDATE_WAIT_SECONDS = "JARVIS_ACTION_CANDIDATE_WAIT_SECONDS"
+_ACTION_CANDIDATE_WAIT_DEFAULT_SECONDS = 1.6
+_ACTION_ACK_RECOVERY_GRACE_SECONDS = "JARVIS_ACTION_ACK_RECOVERY_GRACE_SECONDS"
+_ACTION_ACK_RECOVERY_GRACE_DEFAULT_SECONDS = 8.0
 _ACTION_CONTEXT_APPLICATION_LIMIT = "JARVIS_ACTION_CONTEXT_APPLICATION_LIMIT"
 _ACTION_CONTEXT_APPLICATION_DEFAULT_LIMIT = 250
 _ACTION_CONTEXT_TRIMMED_APPLICATION_NAME_LIMIT = (
@@ -76,6 +84,84 @@ _ACTION_CONTEXT_TRIMMED_APPLICATION_NAME_LIMIT = (
 )
 _ACTION_CONTEXT_TRIMMED_APPLICATION_NAME_DEFAULT_LIMIT = 250
 _ACTION_ACK = "진행하겠습니다!"
+_LOCAL_APP_ALIAS_PROFILE: dict[str, dict[str, tuple[str, ...]]] = {
+    "com.apple.stocks": {
+        "aliases": ("주식", "주식앱", "증권", "Stocks", "stocks"),
+        "capabilities": ("stock", "stocks", "finance", "market", "주식", "증권"),
+        "categories": ("finance", "stocks"),
+        "keywords": ("주식 시세", "증권", "시장"),
+    },
+    "com.apple.weather": {
+        "aliases": ("날씨", "날씨앱", "Weather", "weather"),
+        "capabilities": ("weather", "forecast", "날씨", "예보"),
+        "categories": ("weather",),
+        "keywords": ("오늘 날씨", "지역 날씨"),
+    },
+}
+_ACTION_OBJECT_TERMS = (
+    "browser",
+    "chrome",
+    "safari",
+    "브라우저",
+    "크롬",
+    "사파리",
+    "앱",
+    "어플",
+    "application",
+    "app",
+    "터미널",
+    "terminal",
+    "파일",
+    "file",
+    "폴더",
+    "folder",
+    "다운로드",
+    "downloads",
+    "화면",
+    "screen",
+    "스크린샷",
+    "screenshot",
+    "캡처",
+    "capture",
+    "클립보드",
+    "clipboard",
+    "마우스",
+    "mouse",
+    "키보드",
+    "keyboard",
+)
+_ACTION_VERB_TERMS = (
+    "열어",
+    "켜",
+    "실행",
+    "들어가",
+    "검색",
+    "찾아",
+    "클릭",
+    "눌러",
+    "입력",
+    "작성",
+    "타이핑",
+    "복사",
+    "붙여",
+    "캡처",
+    "찍어",
+    "읽어",
+    "봐줘",
+    "보여",
+    "확인",
+    "open",
+    "launch",
+    "run",
+    "search",
+    "find",
+    "click",
+    "type",
+    "copy",
+    "paste",
+    "show",
+    "list",
+)
 TokenAuth = Annotated[
     HTTPAuthorizationCredentials | None,
     Depends(bearer_scheme),
@@ -153,6 +239,9 @@ class RuntimeApplicationRequest(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     display_name: str | None = Field(default=None, max_length=160)
     aliases: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+    categories: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
     bundle_id: str | None = Field(default=None, max_length=240)
     path: str | None = None
     executable: str | None = Field(default=None, max_length=240)
@@ -166,6 +255,8 @@ class TerminalProfileRequest(BaseModel):
     shell_path: str | None = None
     cwd: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
+    allowed_commands: list[str] = Field(default_factory=list)
+    allowed_cwds: list[str] = Field(default_factory=list)
     supports_pty: bool = False
     requires_confirm: bool = True
     timeout_seconds: int = Field(default=30, ge=1, le=600)
@@ -316,10 +407,39 @@ def _action_runtime_config_payload() -> dict[str, object]:
 
 
 def _action_intent_done_grace_seconds() -> float:
-    return max(0.0, _float_env(
-        _ACTION_INTENT_DONE_GRACE_SECONDS,
-        _ACTION_INTENT_DONE_GRACE_DEFAULT_SECONDS,
-    ))
+    configured = max(
+        0.0,
+        _float_env(
+            _ACTION_INTENT_DONE_GRACE_SECONDS,
+            _ACTION_INTENT_DONE_GRACE_DEFAULT_SECONDS,
+        ),
+    )
+    cap = max(0.0, _float_env("JARVIS_ACTION_INTENT_DONE_GRACE_CAP_SECONDS", 0.45))
+    return min(configured, cap)
+
+
+def _action_candidate_wait_seconds() -> float:
+    configured = max(
+        0.0,
+        _float_env(
+            _ACTION_CANDIDATE_WAIT_SECONDS,
+            _ACTION_CANDIDATE_WAIT_DEFAULT_SECONDS,
+        ),
+    )
+    cap = max(0.0, _float_env("JARVIS_ACTION_CANDIDATE_WAIT_CAP_SECONDS", 2.5))
+    return min(configured, cap)
+
+
+def _action_ack_recovery_grace_seconds() -> float:
+    configured = max(
+        0.0,
+        _float_env(
+            _ACTION_ACK_RECOVERY_GRACE_SECONDS,
+            _ACTION_ACK_RECOVERY_GRACE_DEFAULT_SECONDS,
+        ),
+    )
+    cap = max(0.0, _float_env("JARVIS_ACTION_ACK_RECOVERY_GRACE_CAP_SECONDS", 8.0))
+    return min(configured, cap)
 
 
 def _action_context_application_limit() -> int:
@@ -342,12 +462,846 @@ def _action_context_trimmed_application_name_limit() -> int:
     )
 
 
-def _is_assistant_done_chunk(chunk: bytes) -> bool:
+def _sse_payloads_from_chunk(chunk: bytes) -> list[tuple[str, dict[str, object]]]:
     try:
         text = chunk.decode("utf-8")
     except UnicodeDecodeError:
+        return []
+
+    payloads: list[tuple[str, dict[str, object]]] = []
+    event_name: str | None = None
+    data_lines: list[str] = []
+    for line in text.splitlines():
+        line = line.rstrip("\r\n")
+        if line.startswith("event:"):
+            event_name = line.split(":", 1)[1].strip()
+            data_lines = []
+            continue
+        if line.startswith("data:"):
+            data_lines.append(line.split(":", 1)[1].strip())
+            continue
+        if line != "" or event_name is None:
+            continue
+        try:
+            payload = json.loads("\n".join(data_lines) or "{}")
+        except json.JSONDecodeError:
+            event_name = None
+            data_lines = []
+            continue
+        payloads.append((event_name, payload))
+        event_name = None
+        data_lines = []
+
+    if event_name is not None and data_lines:
+        try:
+            payload = json.loads("\n".join(data_lines) or "{}")
+        except json.JSONDecodeError:
+            return payloads
+        payloads.append((event_name, payload))
+    return payloads
+
+
+def _assistant_chunk_content(
+    chunk: bytes,
+    *,
+    event_names: set[str],
+) -> str | None:
+    for event_name, payload in _sse_payloads_from_chunk(chunk):
+        if event_name not in event_names:
+            continue
+        content = payload.get("content")
+        if content is None:
+            content = payload.get("text")
+        if isinstance(content, str):
+            return content
+    return None
+
+
+def _is_assistant_done_chunk(chunk: bytes) -> bool:
+    return any(
+        event_name in {"assistant_done", "conversation.done", "done"}
+        for event_name, _payload in _sse_payloads_from_chunk(chunk)
+    )
+
+
+def _is_action_ack_delta_chunk(chunk: bytes) -> bool:
+    content = _assistant_chunk_content(chunk, event_names={"assistant_delta"})
+    return isinstance(content, str) and content.strip() == _ACTION_ACK.strip()
+
+
+def _is_action_ack_done_chunk(chunk: bytes) -> bool:
+    content = _assistant_chunk_content(
+        chunk,
+        event_names={"assistant_done", "conversation.done", "done"},
+    )
+    return isinstance(content, str) and content.strip() == _ACTION_ACK.strip()
+
+
+def _is_embedded_action_handling_chunk(chunk: bytes) -> bool:
+    for event_name, payload in _sse_payloads_from_chunk(chunk):
+        if event_name in {
+            "action_compile_retry",
+            "action_dispatch",
+            "action_result",
+            "actions",
+        }:
+            return True
+        summary = payload.get("summary")
+        if (
+            event_name in {"assistant_done", "conversation.done", "done"}
+            and isinstance(summary, str)
+            and summary.startswith("embedded action ")
+        ):
+            return True
+    return False
+
+
+def _action_ack_suppressed_done() -> bytes:
+    return _sse_event(
+        "assistant_done",
+        {
+            "content": "액션 판단이 지연되어 실행하지 않았습니다.",
+            "summary": "action ack suppressed before dispatch",
+            "status": "timeout",
+            "has_actions": False,
+            "action_count": 0,
+            "action_results": [],
+            "failure_reason": "action_decision_timeout",
+        },
+    )
+
+
+def _looks_like_direct_client_action_request(
+    message: str,
+    *,
+    context: dict[str, object] | None = None,
+) -> bool:
+    text = message.strip()
+    if not text:
         return False
-    return "event: assistant_done" in text or "event: conversation.done" in text
+    if _weather_app_target_from_message(text, context=context) is not None:
+        return True
+    if _application_open_target_from_message(text, context=context) is not None:
+        return True
+    if _open_url_from_message(text) is not None:
+        return True
+    if _terminal_command_from_message(text, context=context) is not None:
+        return True
+    folded = text.casefold()
+    has_object = any(term in folded for term in _ACTION_OBJECT_TERMS)
+    has_verb = any(term in folded for term in _ACTION_VERB_TERMS)
+    if has_object and has_verb:
+        return True
+    if _browser_search_query_from_message(text) is not None:
+        return True
+    if _browser_result_index_from_message(text) is not None and _browser_context_active(
+        context
+    ):
+        return True
+    if _downloads_folder_requested(folded):
+        return True
+    if any(term in folded for term in ("open ", "launch ", "run ")):
+        return True
+    return False
+
+
+def _normalized_action_match_key(value: str) -> str:
+    return re.sub(r"\s+", "", value.strip().casefold())
+
+
+def _application_candidates(app: object) -> tuple[str | None, list[str]]:
+    if isinstance(app, str):
+        name = app.strip()
+        return (name or None), [name] if name else []
+    if not isinstance(app, dict):
+        return None, []
+    name_value = app.get("name") or app.get("display_name")
+    name = name_value.strip() if isinstance(name_value, str) else None
+    candidates: list[str] = []
+    for key in (
+        "name",
+        "display_name",
+        "bundle_id",
+        "aliases",
+        "capabilities",
+        "categories",
+        "keywords",
+    ):
+        value = app.get(key)
+        if isinstance(value, str) and value.strip():
+            candidates.append(value.strip())
+        elif isinstance(value, list):
+            candidates.extend(
+                item.strip()
+                for item in value
+                if isinstance(item, str) and item.strip()
+            )
+    return name, candidates
+
+
+def _application_open_target_from_message(
+    message: str,
+    *,
+    context: dict[str, object] | None,
+) -> str | None:
+    folded = message.casefold()
+    if not _application_open_requested(folded):
+        return None
+    message_key = _normalized_action_match_key(message)
+    applications = context.get("available_applications") if context else None
+    app_items = applications if isinstance(applications, list) else []
+    for app in app_items:
+        name, candidates = _application_candidates(app)
+        if not name:
+            continue
+        for candidate in candidates:
+            candidate_key = _normalized_action_match_key(candidate)
+            if len(candidate_key) >= 3 and candidate_key in message_key:
+                return name
+
+    # Runtime profiles may still be warming up; keep a tiny alias table for common apps.
+    fallback_aliases = {
+        "sublimetext": "Sublime Text",
+        "sublime": "Sublime Text",
+        "서브라임": "Sublime Text",
+        "주식": "Stocks",
+        "주식앱": "Stocks",
+        "증권": "Stocks",
+    }
+    for alias, target in fallback_aliases.items():
+        if alias in message_key:
+            return target
+    return None
+
+
+def _application_open_requested(folded_message: str) -> bool:
+    if any(
+        term in folded_message
+        for term in ("열어", "켜", "실행", "open", "launch", "run")
+    ):
+        return True
+    has_local_app_reference = any(
+        term in folded_message
+        for term in ("내 노트북", "내 맥", "내 mac", "로컬", "local")
+    ) and any(term in folded_message for term in ("앱", "어플", "app", "application"))
+    return has_local_app_reference
+
+
+def _weather_app_target_from_message(
+    message: str,
+    *,
+    context: dict[str, object] | None,
+) -> str | None:
+    if not _weather_requested(message):
+        return None
+    explicit_app_open = _explicit_weather_app_open_requested(message)
+    if (
+        not explicit_app_open
+        and _active_app_matches(context, ("weather", "날씨", "com.apple.weather"))
+    ):
+        return None
+
+    applications = context.get("available_applications") if context else None
+    app_items = applications if isinstance(applications, list) else []
+    for app in app_items:
+        name, candidates = _application_candidates(app)
+        if not name:
+            continue
+        candidate_keys = {
+            _normalized_action_match_key(candidate)
+            for candidate in candidates
+            if candidate
+        }
+        if candidate_keys.intersection(
+            {"weather", "날씨", "forecast", "예보", "com.apple.weather"}
+        ):
+            return name
+
+    if _context_supports_any_action(context, ("app.open", "app_control")):
+        return "Weather"
+    return None
+
+
+def _weather_requested(message: str) -> bool:
+    folded = message.casefold()
+    return any(term in folded for term in ("날씨", "weather", "forecast", "예보"))
+
+
+def _explicit_weather_app_open_requested(message: str) -> bool:
+    folded = message.casefold()
+    message_key = _normalized_action_match_key(message)
+    mentions_weather_app = (
+        "날씨앱" in message_key
+        or "날씨어플" in message_key
+        or "weatherapp" in message_key
+        or "weatherapplication" in message_key
+        or "com.apple.weather" in folded
+    )
+    if not mentions_weather_app:
+        return False
+    return any(
+        term in folded
+        for term in (
+            "켜",
+            "열어",
+            "실행",
+            "재실행",
+            "다시",
+            "open",
+            "launch",
+            "reopen",
+            "focus",
+            "start",
+        )
+    )
+
+
+def _active_app_matches(
+    context: dict[str, object] | None,
+    candidates: tuple[str, ...],
+) -> bool:
+    if not context:
+        return False
+    candidate_keys = {_normalized_action_match_key(candidate) for candidate in candidates}
+    containers = [
+        context,
+        context.get("working_context"),
+        context.get("latest_action_result"),
+        context.get("latest_observation"),
+    ]
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        for key in ("active_app", "launched_app", "app", "bundle_id"):
+            value = container.get(key)
+            if isinstance(value, str) and _normalized_action_match_key(value) in candidate_keys:
+                return True
+    return False
+
+
+def _open_url_from_message(message: str) -> str | None:
+    folded = message.casefold()
+    if not any(term in folded for term in ("열어", "들어가", "open", "go to", "navigate")):
+        return None
+    match = re.search(
+        r"(?P<url>(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}(?:/[^\s]*)?)",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    url = match.group("url").strip(" \t\r\n,，.。!?")
+    if not url:
+        return None
+    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+        url = f"https://{url}"
+    return url
+
+
+def _terminal_action_from_message(
+    message: str,
+    *,
+    context: dict[str, object] | None,
+) -> ClientAction | None:
+    if not _terminal_enabled(context):
+        return None
+    command = _terminal_command_from_message(message, context=context)
+    if not command:
+        return None
+    terminal = context.get("terminal") if context else None
+    terminal_context = terminal if isinstance(terminal, dict) else {}
+    args: dict[str, object] = {"command": command}
+    cwd = _terminal_cwd(command, terminal_context)
+    if cwd:
+        args["cwd"] = cwd
+    timeout_seconds = terminal_context.get("timeout_seconds")
+    if isinstance(timeout_seconds, int | float) and timeout_seconds > 0:
+        args["timeout"] = int(timeout_seconds)
+    env = terminal_context.get("env")
+    if isinstance(env, dict) and env:
+        args["env"] = {
+            str(key): str(value)
+            for key, value in env.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+    shell = terminal_context.get("shell")
+    return ClientAction(
+        type="terminal",
+        command="execute",
+        target=shell.strip() if isinstance(shell, str) and shell.strip() else None,
+        payload=command,
+        args=args,
+        description=f"Run terminal command: {command}",
+        requires_confirm=True,
+    )
+
+
+def _terminal_command_from_message(
+    message: str,
+    *,
+    context: dict[str, object] | None,
+) -> str | None:
+    folded = message.casefold()
+    terminalish = any(
+        term in folded
+        for term in ("터미널", "terminal", "쉘", "shell", "명령어", "command")
+    )
+    runish = any(
+        term in folded
+        for term in ("실행", "쳐", "입력", "해줘", "run", "execute", "보여", "확인")
+    )
+    if not (terminalish and runish):
+        return None
+
+    explicit = _quoted_terminal_command(message)
+    if explicit and _terminal_command_allowed(explicit, context):
+        return explicit
+
+    command = _terminal_command_after_marker(message)
+    if command and _terminal_command_allowed(command, context):
+        return command
+
+    natural = _known_terminal_command_for_message(folded, context=context)
+    if natural and _terminal_command_allowed(natural, context):
+        return natural
+    return None
+
+
+def _quoted_terminal_command(message: str) -> str | None:
+    for pattern in (r"`([^`]+)`", r'"([^"]+)"', r"'([^']+)'"):
+        match = re.search(pattern, message)
+        if match:
+            command = match.group(1).strip()
+            if command:
+                return command
+    return None
+
+
+def _terminal_command_after_marker(message: str) -> str | None:
+    marker = r"(?:터미널(?:에서|로)?|terminal|쉘(?:에서|로)?|shell|명령어|command)"
+    command_tail = (
+        r"\s*(?:에서|로)?\s*(?P<command>.+?)\s*"
+        r"(?:실행(?:해줘|해|시켜줘)?|쳐줘|입력(?:해줘)?|해줘|run|execute)?\s*$"
+    )
+    match = re.search(
+        marker + command_tail,
+        message,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    command = match.group("command").strip(" \t\r\n.。!?")
+    command = re.sub(
+        r"\s*(?:실행(?:해줘|해|시켜줘)?|쳐줘|입력(?:해줘)?|해줘|run|execute)\s*$",
+        "",
+        command,
+        flags=re.IGNORECASE,
+    ).strip()
+    if not command or len(command) > 240:
+        return None
+    return command
+
+
+def _known_terminal_command_for_message(
+    folded_message: str,
+    *,
+    context: dict[str, object] | None,
+) -> str | None:
+    allowed = _terminal_allowed_commands(context)
+    normalized_allowed = {
+        _terminal_command_root(command): command
+        for command in allowed
+        if command.strip()
+    }
+    for command in allowed:
+        if command and command.casefold() in folded_message:
+            return command
+    if (
+        "git status" in normalized_allowed
+        and "git" in folded_message
+        and "status" in folded_message
+    ):
+        return normalized_allowed["git status"]
+    if "pwd" in normalized_allowed and any(
+        term in folded_message for term in ("pwd", "현재 위치", "현재경로", "경로")
+    ):
+        return normalized_allowed["pwd"]
+    if "ls" in normalized_allowed and any(
+        term in folded_message for term in ("ls", "목록", "리스트", "파일")
+    ):
+        return normalized_allowed["ls"]
+    return None
+
+
+def _terminal_enabled(context: dict[str, object] | None) -> bool:
+    if not _context_supports_any_action(context, ("terminal.run", "terminal")):
+        return False
+    if not context:
+        return True
+    terminal = context.get("terminal")
+    if isinstance(terminal, dict):
+        return bool(terminal.get("enabled", False))
+    return True
+
+
+def _terminal_allowed_commands(context: dict[str, object] | None) -> list[str]:
+    terminal = context.get("terminal") if context else None
+    containers = [terminal, context] if isinstance(terminal, dict) else [context]
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        value = container.get("allowed_commands")
+        if isinstance(value, list):
+            result = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+            if result:
+                return result
+    return ["echo", "pwd", "ls", "git status"]
+
+
+def _terminal_command_allowed(
+    command: str,
+    context: dict[str, object] | None,
+) -> bool:
+    allowed = _terminal_allowed_commands(context)
+    command_key = command.strip().casefold()
+    for allowed_command in allowed:
+        allowed_key = allowed_command.strip().casefold()
+        if not allowed_key:
+            continue
+        if command_key == allowed_key or command_key.startswith(f"{allowed_key} "):
+            return True
+    return False
+
+
+def _terminal_command_root(command: str) -> str:
+    return re.sub(r"\s+", " ", command.strip().casefold())
+
+
+def _terminal_cwd(command: str, terminal_context: dict[str, object]) -> str | None:
+    cwd = terminal_context.get("cwd")
+    if isinstance(cwd, str) and cwd.strip():
+        allowed_cwds = terminal_context.get("allowed_cwds")
+        if isinstance(allowed_cwds, list) and allowed_cwds:
+            allowed = {item for item in allowed_cwds if isinstance(item, str)}
+            if cwd not in allowed:
+                return None
+        return cwd.strip()
+    return None
+
+
+def _local_direct_action_decision(
+    message: str,
+    *,
+    context: dict[str, object] | None,
+) -> ActionIntentDecision | None:
+    text = message.strip()
+    if not text:
+        return None
+
+    weather_target = _weather_app_target_from_message(text, context=context)
+    if weather_target and _context_supports_any_action(context, ("app.open", "app_control")):
+        action = ClientAction(
+            type="app_control",
+            command="open",
+            target=weather_target,
+            args={},
+            description=f"Open {weather_target}",
+            requires_confirm=False,
+        )
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="app.open",
+            confidence=0.9,
+            reason="local action template: weather app first",
+            actions=[action],
+        )
+
+    url = _open_url_from_message(text)
+    if url and _context_supports_any_action(context, ("open_url", "browser.navigate")):
+        action = ClientAction(
+            type="open_url",
+            command=None,
+            target=url,
+            args={"browser": _default_browser(context)},
+            description="Open URL",
+            requires_confirm=False,
+        )
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="open_url",
+            confidence=0.92,
+            reason="local action template: explicit url open",
+            actions=[action],
+        )
+
+    app_target = _application_open_target_from_message(text, context=context)
+    if app_target and _context_supports_any_action(context, ("app.open", "app_control")):
+        action = ClientAction(
+            type="app_control",
+            command="open",
+            target=app_target,
+            args={},
+            description=f"Open {app_target}",
+            requires_confirm=False,
+        )
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="app.open",
+            confidence=0.9,
+            reason="local action template: explicit app open",
+            actions=[action],
+        )
+
+    terminal_action = _terminal_action_from_message(text, context=context)
+    if terminal_action is not None:
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="terminal.run",
+            confidence=0.88,
+            reason="local action template: terminal command",
+            actions=[terminal_action],
+        )
+
+    result_index = _browser_result_index_from_message(text)
+    if result_index is not None and _browser_context_active(context):
+        action = ClientAction(
+            type="browser_control",
+            command="select_result",
+            target=None,
+            args={"index": result_index},
+            description="Open browser search result",
+            requires_confirm=False,
+        )
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="browser.select_result",
+            confidence=0.9,
+            reason="local action template: browser result selection",
+            actions=[action],
+        )
+
+    query = _browser_search_query_from_message(text)
+    if query and _context_supports_any_action(
+        context,
+        ("open_url", "browser.search", "browser.navigate", "browser"),
+    ):
+        action = ClientAction(
+            type="open_url",
+            command=None,
+            target=_search_url_for_query(query, context=context),
+            args={"browser": _default_browser(context), "query": query},
+            description="Search browser",
+            requires_confirm=False,
+        )
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="browser.search",
+            confidence=0.92,
+            reason="local action template: explicit browser search",
+            actions=[action],
+        )
+
+    folded = text.casefold()
+    if _browser_open_requested(folded) and _context_supports_any_action(
+        context,
+        ("browser.open", "browser"),
+    ):
+        action = ClientAction(
+            type="browser",
+            command="open",
+            target=None,
+            args={"browser": _default_browser(context)},
+            description="Open browser",
+            requires_confirm=False,
+        )
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="browser.open",
+            confidence=0.9,
+            reason="local action template: explicit browser open",
+            actions=[action],
+        )
+
+    if _downloads_folder_requested(folded) and _context_supports_any_action(
+        context,
+        ("file.read", "file_read"),
+    ):
+        path = _known_folder_path(context, "downloads") or "~/Downloads"
+        action = ClientAction(
+            type="file_read",
+            command=None,
+            target=path,
+            args={
+                "path": path,
+                "known_folder": "downloads",
+                "mode": "list_directory",
+            },
+            description="Inspect Downloads folder",
+            requires_confirm=False,
+        )
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="file.read",
+            confidence=0.88,
+            reason="local action template: downloads folder inspection",
+            actions=[action],
+        )
+
+    return None
+
+
+def _browser_context_active(context: dict[str, object] | None) -> bool:
+    if not context:
+        return False
+    return bool(
+        context.get("browser_active")
+        or context.get("last_query")
+        or context.get("last_url")
+    )
+
+
+def _browser_result_index_from_message(message: str) -> int | None:
+    folded = message.casefold()
+    if not any(term in folded for term in ("결과", "레시피", "링크", "result", "link")):
+        return None
+    ordinal_map = {
+        "첫": 1,
+        "첫번째": 1,
+        "1번째": 1,
+        "두": 2,
+        "두번째": 2,
+        "2번째": 2,
+        "세": 3,
+        "세번째": 3,
+        "3번째": 3,
+        "fourth": 4,
+        "4번째": 4,
+        "first": 1,
+        "second": 2,
+        "third": 3,
+    }
+    for token, index in ordinal_map.items():
+        if token in folded:
+            return index
+    match = re.search(r"\b([1-9])(?:st|nd|rd|th)?\b", folded)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _browser_search_query_from_message(message: str) -> str | None:
+    folded = message.casefold()
+    browserish = any(
+        term in folded
+        for term in ("브라우저", "크롬", "chrome", "browser", "google", "구글", "naver", "네이버")
+    )
+    searchish = any(term in folded for term in ("검색", "찾아", "search", "find", "look up"))
+    pageish = any(
+        term in folded
+        for term in ("페이지", "사이트", "들어가", "열어", "open", "go to", "navigate")
+    )
+    if not (browserish and (searchish or pageish)):
+        return None
+    if _browser_open_requested(folded) and not (
+        searchish or _has_query_after_browser_framing(message)
+    ):
+        return None
+    query = normalize_browser_search_query(message)
+    if not query or _browser_open_requested(query.casefold()):
+        return None
+    return query
+
+
+def _has_query_after_browser_framing(message: str) -> bool:
+    query = normalize_browser_search_query(message)
+    return bool(query and query.casefold() != message.strip().casefold())
+
+
+def _browser_open_requested(folded_message: str) -> bool:
+    return any(
+        term in folded_message for term in ("브라우저", "크롬", "chrome", "browser")
+    ) and any(
+        term in folded_message
+        for term in ("열어", "켜", "실행", "open", "launch")
+    )
+
+
+def _downloads_folder_requested(folded_message: str) -> bool:
+    has_downloads = any(term in folded_message for term in ("다운로드", "downloads"))
+    has_folder = any(term in folded_message for term in ("폴더", "folder", "파일", "file"))
+    has_inspect = any(
+        term in folded_message
+        for term in ("뭐", "무엇", "있는지", "봐", "보여", "확인", "list", "show")
+    )
+    return has_downloads and (has_folder or has_inspect)
+
+
+def _context_supports_any_action(
+    context: dict[str, object] | None,
+    action_names: tuple[str, ...],
+) -> bool:
+    if not context:
+        return True
+    configured: list[str] = []
+    for key in ("enabled_capabilities", "capabilities"):
+        value = context.get(key)
+        if isinstance(value, list):
+            configured.extend(item for item in value if isinstance(item, str))
+        elif isinstance(value, dict):
+            configured.extend(str(key) for key in value.keys())
+    if not configured:
+        return True
+    normalized = {_normalize_action_name(name) for name in configured}
+    return any(_normalize_action_name(name) in normalized for name in action_names)
+
+
+def _normalize_action_name(name: str) -> str:
+    return name.strip().casefold().replace("_", ".")
+
+
+def _default_browser(context: dict[str, object] | None) -> str:
+    if context:
+        browser = context.get("default_browser")
+        if isinstance(browser, str) and browser.strip():
+            return browser.strip()
+    return "chrome"
+
+
+def _search_url_for_query(query: str, *, context: dict[str, object] | None) -> str:
+    engine = ""
+    if context:
+        raw_engine = context.get("search_engine")
+        if isinstance(raw_engine, str):
+            engine = raw_engine.strip().casefold()
+    encoded = quote_plus(query)
+    if engine == "naver":
+        return f"https://search.naver.com/search.naver?query={encoded}"
+    return f"https://www.google.com/search?q={encoded}"
+
+
+def _known_folder_path(context: dict[str, object] | None, key: str) -> str | None:
+    if not context:
+        return None
+    for container_key in ("known_folders", "folders", "filesystem"):
+        value = context.get(container_key)
+        if isinstance(value, dict):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+            nested = value.get("known_folders")
+            if isinstance(nested, dict):
+                candidate = nested.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    return candidate.strip()
+    return None
 
 
 def _resolve_client_action_decision(
@@ -355,8 +1309,14 @@ def _resolve_client_action_decision(
     *,
     request: Request | None,
     user_id: str | None,
+    context: dict[str, object] | None = None,
 ) -> ActionIntentDecision | None:
-    return _client_action_decision(message, request=request, user_id=user_id)
+    return _client_action_decision(
+        message,
+        request=request,
+        user_id=user_id,
+        context=context,
+    )
 
 
 def _start_action_decision_future(
@@ -364,6 +1324,7 @@ def _start_action_decision_future(
     *,
     request: Request,
     user_id: str,
+    context: dict[str, object] | None = None,
 ) -> tuple[
     concurrent.futures.ThreadPoolExecutor,
     concurrent.futures.Future[ActionIntentDecision | None],
@@ -377,6 +1338,7 @@ def _start_action_decision_future(
         message,
         request=request,
         user_id=user_id,
+        context=context,
     )
 
 
@@ -442,6 +1404,16 @@ def _stream_realtime_with_action_arbitration(
 ) -> Generator[bytes, None, None]:
     """Stream core bytes immediately while action classification runs in parallel."""
     emitted_action_intent = False
+    action_candidate = _looks_like_direct_client_action_request(
+        message,
+        context=context,
+    )
+
+    def done_wait_seconds() -> float:
+        grace = _action_intent_done_grace_seconds()
+        if not action_candidate:
+            return grace
+        return max(grace, _action_candidate_wait_seconds())
 
     def ready_decision_chunks(*, timeout: float = 0.0) -> tuple[list[bytes], bool]:
         nonlocal emitted_action_intent
@@ -499,15 +1471,45 @@ def _stream_realtime_with_action_arbitration(
             action_dispatcher=action_dispatcher,
             context=context,
         ):
+            if _is_embedded_action_handling_chunk(chunk):
+                emitted_action_intent = True
+                yield chunk
+                continue
+
+            if _is_action_ack_delta_chunk(chunk):
+                decision_chunks, stopped = ready_decision_chunks()
+                for decision_chunk in decision_chunks:
+                    yield decision_chunk
+                if stopped:
+                    return
+                continue
+
             if _is_assistant_done_chunk(chunk):
+                if _is_action_ack_done_chunk(chunk):
+                    decision_chunks, stopped = ready_decision_chunks(
+                        timeout=_action_ack_recovery_grace_seconds(),
+                    )
+                    for decision_chunk in decision_chunks:
+                        yield decision_chunk
+                    if stopped:
+                        return
+                    if action_future is not None and not emitted_action_intent:
+                        emitted_action_intent = True
+                        yield _sse_event(
+                            "action_intent",
+                            _action_intent_payload(None, unavailable=True),
+                        )
+                    yield _action_ack_suppressed_done()
+                    return
+
                 decision_chunks, stopped = ready_decision_chunks(
-                    timeout=_action_intent_done_grace_seconds(),
+                    timeout=done_wait_seconds(),
                 )
                 for decision_chunk in decision_chunks:
                     yield decision_chunk
-                yield chunk
                 if stopped:
                     return
+                yield chunk
                 continue
 
             decision_chunks, stopped = ready_decision_chunks()
@@ -518,7 +1520,7 @@ def _stream_realtime_with_action_arbitration(
             yield chunk
 
         decision_chunks, stopped = ready_decision_chunks(
-            timeout=_action_intent_done_grace_seconds(),
+            timeout=done_wait_seconds(),
         )
         for decision_chunk in decision_chunks:
             yield decision_chunk
@@ -1072,6 +2074,9 @@ def _merge_runtime_profile_context(
                 "shell",
                 "shell_path",
                 "cwd",
+                "env",
+                "allowed_commands",
+                "allowed_cwds",
                 "supports_pty",
                 "requires_confirm",
                 "timeout_seconds",
@@ -1102,8 +2107,38 @@ def _runtime_applications_for_context(value: object) -> list[dict[str, object]]:
             values = _string_list(item.get(key))
             if values:
                 app[key] = values[:12]
+        _enrich_runtime_application_aliases(app)
         applications.append(app)
     return applications
+
+
+def _enrich_runtime_application_aliases(app: dict[str, object]) -> None:
+    profile = _local_app_alias_profile_for_app(app)
+    if not profile:
+        return
+    for key, values in profile.items():
+        merged = _string_list(app.get(key))
+        merged.extend(values)
+        app[key] = list(dict.fromkeys(merged))[:12]
+
+
+def _local_app_alias_profile_for_app(
+    app: dict[str, object],
+) -> dict[str, tuple[str, ...]] | None:
+    identity_values = [
+        value
+        for key in ("bundle_id", "name", "display_name", "executable")
+        for value in [app.get(key)]
+        if isinstance(value, str) and value.strip()
+    ]
+    identity_keys = {_normalized_action_match_key(value) for value in identity_values}
+    for bundle_id, profile in _LOCAL_APP_ALIAS_PROFILE.items():
+        bundle_key = _normalized_action_match_key(bundle_id)
+        aliases = profile.get("aliases", ())
+        alias_keys = {_normalized_action_match_key(alias) for alias in aliases}
+        if bundle_key in identity_keys or identity_keys.intersection(alias_keys):
+            return profile
+    return None
 
 
 def _string_list(value: object) -> list[str]:
@@ -1170,6 +2205,7 @@ def _client_action_decision(
     *,
     request: Request | None = None,
     user_id: str | None = None,
+    context: dict[str, object] | None = None,
     validation_errors: list[object] | None = None,
 ) -> ActionIntentDecision | None:
     if not should_try_client_action_classifier(message):
@@ -1182,9 +2218,14 @@ def _client_action_decision(
             actions=[],
         )
     context = _trim_action_context_for_message(
-        _client_action_context(request=request, user_id=user_id),
+        context
+        if context is not None
+        else _client_action_context(request=request, user_id=user_id),
         message,
     )
+    local_decision = _local_direct_action_decision(message, context=context)
+    if local_decision is not None:
+        return local_decision
     latest_observation = _latest_observation_context(request=request, user_id=user_id)
     decision = classify_client_action_intent_decision(
         message,
@@ -1193,14 +2234,23 @@ def _client_action_decision(
         validation_errors=validation_errors,  # type: ignore[arg-type]
     )
     if decision is not None:
+        fallback_decision = _local_direct_action_decision(message, context=context)
+        if not _is_direct_action_decision(decision) and fallback_decision is not None:
+            return fallback_decision
         return decision
-    return _client_action_decision_via_core_model(
+    core_decision = _client_action_decision_via_core_model(
         message,
         request=request,
         user_id=user_id,
         context=context,
         validation_errors=validation_errors,
     )
+    if core_decision is not None:
+        fallback_decision = _local_direct_action_decision(message, context=context)
+        if not _is_direct_action_decision(core_decision) and fallback_decision is not None:
+            return fallback_decision
+        return core_decision
+    return None
 
 
 def _client_action_decision_via_core_model(
@@ -1515,12 +2565,14 @@ def _stream_orchestrated_conversation(
     action_future: concurrent.futures.Future[ActionIntentDecision | None] | None = None
     route_executor: concurrent.futures.ThreadPoolExecutor | None = None
     route_future: concurrent.futures.Future[RoutingDecision] | None = None
-    if req.override != ContractConversationMode.PLANNING:
-        action_executor, action_future = _start_action_decision_future(
-            req.message,
-            request=request,
-            user_id=principal.user_id,
-        )
+    client_action_context = _client_action_context(
+        request=request,
+        user_id=principal.user_id,
+    )
+    trimmed_action_context = _trim_action_context_for_message(
+        client_action_context,
+        req.message,
+    )
     routing_context = ConversationContext(
         recent_failures=req.recent_failures,
         ambiguity_count=req.ambiguity_count,
@@ -1529,6 +2581,37 @@ def _stream_orchestrated_conversation(
     route_override = req.override.value if req.override else None
 
     if route_override in (None, ConversationMode.REALTIME.value):
+        if req.override != ContractConversationMode.PLANNING:
+            local_decision = _local_direct_action_decision(
+                req.message,
+                context=trimmed_action_context,
+            )
+            if _is_direct_action_decision(local_decision):
+                yield _sse_event(
+                    "action_intent",
+                    _action_intent_payload(local_decision),
+                )
+                yield _sse_event("assistant_delta", {"content": _ACTION_ACK})
+                yield from _stream_direct_action_decision(
+                    decision=local_decision,
+                    message=req.message,
+                    request_id=request_id,
+                    user_id=principal.user_id,
+                    action_dispatcher=request.app.state.action_dispatcher,
+                )
+                return
+
+            if _looks_like_direct_client_action_request(
+                req.message,
+                context=trimmed_action_context,
+            ):
+                action_executor, action_future = _start_action_decision_future(
+                    req.message,
+                    request=request,
+                    user_id=principal.user_id,
+                    context=trimmed_action_context,
+                )
+
         if route_override is None:
             route_executor, route_future = _start_routing_decision_future(
                 req.message,
@@ -1553,10 +2636,7 @@ def _stream_orchestrated_conversation(
                 message=req.message,
                 user_id=principal.user_id,
                 action_dispatcher=request.app.state.action_dispatcher,
-                context=_client_action_context(
-                    request=request,
-                    user_id=principal.user_id,
-                ),
+                context=client_action_context,
             )
         finally:
             if action_future is not None:
@@ -1580,6 +2660,20 @@ def _stream_orchestrated_conversation(
         yield chunk
 
     action_decision: ActionIntentDecision | None = None
+    if (
+        req.override != ContractConversationMode.PLANNING
+        and action_future is None
+        and _looks_like_direct_client_action_request(
+            req.message,
+            context=trimmed_action_context,
+        )
+    ):
+        action_executor, action_future = _start_action_decision_future(
+            req.message,
+            request=request,
+            user_id=principal.user_id,
+            context=trimmed_action_context,
+        )
     if action_future is not None:
         try:
             action_decision = action_future.result()
@@ -2384,9 +3478,10 @@ def upsert_client_runtime_profile(
 ):
     _ = authorization_header
     principal = request.state.principal
+    profile = enrich_runtime_profile_applications(req.model_dump())
     result = request.app.state.core_client.set_runtime_profile(
         user_id=principal.user_id,
-        body=req.model_dump(),
+        body=profile,
     )
     _runtime_profile_cache(request)[principal.user_id] = result
     return result
