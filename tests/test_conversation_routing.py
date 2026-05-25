@@ -54,6 +54,18 @@ def test_code_and_analysis_request_escalates_to_deep() -> None:
     assert decision.triggered is True
 
 
+def test_code_output_request_escalates_to_deep() -> None:
+    for message in (
+        "FastAPI에서 SSE 스트림 보내는 예제 코드 제공해줘",
+        "todo 삭제 매칭 함수를 파이썬 코드로 작성해줘",
+        "write example code for a streaming response",
+    ):
+        decision = evaluate_conversation_mode(message)
+        assert decision.mode == ConversationMode.DEEP
+        assert decision.triggered is True
+        assert "code generation request" in decision.reasons
+
+
 def test_multistep_request_escalates_to_planning() -> None:
     decision = evaluate_conversation_mode(
         """

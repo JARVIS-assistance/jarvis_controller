@@ -1,6 +1,8 @@
 import json
 import logging
 import time
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from fastapi.testclient import TestClient
 from jarvis_contracts import (
@@ -14,7 +16,11 @@ from jarvis_contracts import (
     JarvisCoreEndpoints,
 )
 from jarvis_controller.app import SuppressPendingActionPollAccessLog, create_app
-from jarvis_controller.middleware.core_client import CoreResponse
+from jarvis_controller.middleware.core_client import (
+    CoreBinaryResponse,
+    CoreResponse,
+    CoreStreamResponse,
+)
 from jarvis_controller.middleware.gateway_client import GatewayPrincipal
 
 from router.router import _client_action_context
@@ -86,6 +92,10 @@ class StubCoreClient:
     last_path: str | None = None
     last_chat_request: dict[str, object] | None = None
     last_chat_stream_request: dict[str, object] | None = None
+    last_model_selection_request: dict[str, object] | None = None
+    last_todo_request: dict[str, object] | None = None
+    last_tts_request: dict[str, object] | None = None
+    last_tts_pcm_request: dict[str, object] | None = None
 
     def chat_request(
         self,
@@ -201,6 +211,168 @@ class StubCoreClient:
         assert user_id == "u1"
         assert model_config_id == "mc1"
         return {"id": model_config_id, "deleted": True}
+
+    def set_model_selection(
+        self,
+        *,
+        user_id: str,
+        body: dict[str, object],
+    ) -> dict[str, object]:
+        assert user_id == "u1"
+        self.last_model_selection_request = {"user_id": user_id, "body": body}
+        return {
+            "realtime_model_config_id": body.get("realtime_model_config_id"),
+            "deep_model_config_id": body.get("deep_model_config_id"),
+        }
+
+    def get_model_selection(self, *, user_id: str) -> dict[str, object]:
+        assert user_id == "u1"
+        return {
+            "realtime_model_config_id": "rt-model-config",
+            "deep_model_config_id": "deep-model-config",
+        }
+
+    def synthesize_speech(
+        self,
+        *,
+        user_id: str,
+        body: dict[str, object],
+        request_id: str = "",
+    ) -> CoreBinaryResponse:
+        self.last_tts_request = {
+            "user_id": user_id,
+            "body": body,
+            "request_id": request_id,
+        }
+        return CoreBinaryResponse(
+            content=b"audio-bytes",
+            media_type="audio/mpeg",
+            headers={
+                "x-tts-provider": "openai",
+                "x-tts-model": "gpt-4o-mini-tts",
+                "x-tts-voice": "marin",
+                "x-ai-generated-voice": "true",
+            },
+        )
+
+    def synthesize_speech_pcm_stream(
+        self,
+        *,
+        user_id: str,
+        body: dict[str, object],
+        request_id: str = "",
+    ) -> CoreStreamResponse:
+        self.last_tts_pcm_request = {
+            "user_id": user_id,
+            "body": body,
+            "request_id": request_id,
+        }
+        chunks = body.get("chunks")
+        chunk_count = len(chunks) if isinstance(chunks, list) else 0
+        return CoreStreamResponse(
+            body=iter([b"pcm-1", b"pcm-2"]),
+            media_type="audio/pcm",
+            headers={
+                "x-tts-provider": "server",
+                "x-tts-format": "pcm_s16le",
+                "x-tts-sample-rate": "24000",
+                "x-tts-channels": "1",
+                "x-tts-sample-width": "2",
+                "x-tts-chunk-count": str(chunk_count),
+                "x-ai-generated-voice": "true",
+            },
+        )
+
+    def list_speech_models(
+        self,
+        *,
+        user_id: str,
+        request_id: str = "",
+    ) -> dict[str, object]:
+        return {
+            "models": [
+                {
+                    "id": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                    "label": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+                    "provider": "qwen",
+                    "is_default": True,
+                },
+                {
+                    "id": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+                    "label": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+                    "provider": "qwen",
+                    "is_default": False,
+                },
+            ]
+        }
+
+    def create_todo(self, *, user_id: str, body: dict[str, object]) -> dict[str, object]:
+        self.last_todo_request = {"method": "create", "user_id": user_id, "body": body}
+        return {
+            "id": "todo-1",
+            "user_id": user_id,
+            **body,
+            "status": "open",
+            "priority": body.get("priority", 3),
+            "calendar_sync_status": "none",
+            "metadata": body.get("metadata", {}),
+            "created_at": "2026-05-13T00:00:00+00:00",
+            "updated_at": "2026-05-13T00:00:00+00:00",
+            "completed_at": None,
+        }
+
+    def list_todos(
+        self,
+        *,
+        user_id: str,
+        status: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 50,
+    ) -> dict[str, object]:
+        self.last_todo_request = {
+            "method": "list",
+            "user_id": user_id,
+            "status": status,
+            "include_deleted": include_deleted,
+            "limit": limit,
+        }
+        return {
+            "items": [
+                {
+                    "id": "todo-1",
+                    "user_id": user_id,
+                    "title": "테스트 todo",
+                    "status": status or "open",
+                }
+            ]
+        }
+
+    def get_todo(self, *, user_id: str, todo_id: str) -> dict[str, object]:
+        self.last_todo_request = {"method": "get", "user_id": user_id, "todo_id": todo_id}
+        return {"id": todo_id, "user_id": user_id, "title": "todo"}
+
+    def update_todo(
+        self,
+        *,
+        user_id: str,
+        todo_id: str,
+        body: dict[str, object],
+    ) -> dict[str, object]:
+        self.last_todo_request = {
+            "method": "update",
+            "user_id": user_id,
+            "todo_id": todo_id,
+            "body": body,
+        }
+        return {"id": todo_id, "user_id": user_id, **body}
+
+    def delete_todo(self, *, user_id: str, todo_id: str) -> dict[str, object]:
+        self.last_todo_request = {
+            "method": "delete",
+            "user_id": user_id,
+            "todo_id": todo_id,
+        }
+        return {"id": todo_id, "deleted": True}
 
     def chat_stream(
         self,
@@ -337,6 +509,229 @@ def test_delete_model_config_proxies_to_core() -> None:
     assert response.status_code == 200
     payload = response.json()
     assert payload == {"id": "mc1", "deleted": True}
+
+
+def test_set_model_selection_proxies_to_core() -> None:
+    stub_core_client.last_model_selection_request = None
+
+    response = client.post(
+        "/chat/model-selection",
+        json={
+            "realtime_model_config_id": "rt-model-config",
+            "deep_model_config_id": "deep-model-config",
+        },
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "realtime_model_config_id": "rt-model-config",
+        "deep_model_config_id": "deep-model-config",
+    }
+    assert stub_core_client.last_model_selection_request == {
+        "user_id": "u1",
+        "body": {
+            "realtime_model_config_id": "rt-model-config",
+            "deep_model_config_id": "deep-model-config",
+        },
+    }
+
+
+def test_get_model_selection_proxies_to_core() -> None:
+    response = client.get("/chat/model-selection", headers=auth_headers())
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "realtime_model_config_id": "rt-model-config",
+        "deep_model_config_id": "deep-model-config",
+    }
+
+
+def test_audio_speech_proxies_to_core_with_current_user() -> None:
+    stub_core_client.last_tts_request = None
+
+    response = client.post(
+        "/audio/speech",
+        json={
+            "text": "안녕하세요",
+            "voice": "marin",
+            "response_format": "mp3",
+        },
+        headers={**auth_headers(), "x-request-id": "r-tts"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"audio-bytes"
+    assert response.headers["content-type"] == "audio/mpeg"
+    assert response.headers["x-tts-provider"] == "openai"
+    assert response.headers["x-ai-generated-voice"] == "true"
+    assert stub_core_client.last_tts_request == {
+        "user_id": "u1",
+        "body": {
+            "text": "안녕하세요",
+            "provider": "openai",
+            "model": "gpt-4o-mini-tts",
+            "voice": "marin",
+            "response_format": "mp3",
+        },
+        "request_id": "r-tts",
+    }
+
+
+def test_audio_speech_pcm_streams_core_response_with_current_user() -> None:
+    stub_core_client.last_tts_pcm_request = None
+
+    response = client.post(
+        "/audio/speech/pcm",
+        json={
+            "chunks": [
+                {
+                    "id": "c-1770000000000",
+                    "text": "안녕하세요. 오늘 일정 요약해드릴게요.",
+                },
+            ],
+            "voice": "marin",
+            "model": "gpt-4o-mini-tts",
+            "sample_rate": 24000,
+            "channels": 1,
+            "sample_width": 2,
+            "format": "pcm_s16le",
+        },
+        headers={**auth_headers(), "x-request-id": "r-tts-pcm"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"pcm-1pcm-2"
+    assert response.headers["content-type"] == "audio/pcm"
+    assert response.headers["x-tts-provider"] == "server"
+    assert response.headers["x-tts-format"] == "pcm_s16le"
+    assert response.headers["x-tts-chunk-count"] == "1"
+    assert stub_core_client.last_tts_pcm_request == {
+        "user_id": "u1",
+        "body": {
+            "chunks": [
+                {
+                    "id": "c-1770000000000",
+                    "text": "안녕하세요. 오늘 일정 요약해드릴게요.",
+                },
+            ],
+            "voice": "default",
+            "sample_rate": 24000,
+            "channels": 1,
+            "sample_width": 2,
+            "format": "pcm_s16le",
+        },
+        "request_id": "r-tts-pcm",
+    }
+
+
+def test_audio_speech_pcm_preserves_user_selected_model() -> None:
+    stub_core_client.last_tts_pcm_request = None
+
+    response = client.post(
+        "/audio/speech/pcm",
+        json={
+            "chunks": [{"id": "c-1770000000000", "text": "안녕하세요."}],
+            "voice": "default",
+            "model": "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+            "sample_rate": 24000,
+            "channels": 1,
+            "sample_width": 2,
+            "format": "pcm_s16le",
+        },
+        headers={**auth_headers(), "x-request-id": "r-tts-selected-model"},
+    )
+
+    assert response.status_code == 200
+    assert stub_core_client.last_tts_pcm_request
+    assert stub_core_client.last_tts_pcm_request["body"]["model"] == (
+        "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+    )
+
+
+def test_audio_speech_models_proxies_to_core_with_current_user() -> None:
+    response = client.get(
+        "/audio/speech/models",
+        headers={**auth_headers(), "x-request-id": "r-tts-models"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["models"][0]["id"] == "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
+
+def test_todo_routes_proxy_to_core_with_current_user() -> None:
+    create_response = client.post(
+        "/todos",
+        json={
+            "title": "소불고기 재료 사기",
+            "due_at": "2026-05-20T09:00:00+09:00",
+            "metadata": {"source": "chat"},
+        },
+        headers=auth_headers(),
+    )
+    assert create_response.status_code == 200
+    assert create_response.json()["id"] == "todo-1"
+    assert stub_core_client.last_todo_request == {
+        "method": "create",
+        "user_id": "u1",
+        "body": {
+            "title": "소불고기 재료 사기",
+            "description": None,
+            "priority": 3,
+            "due_at": "2026-05-20T09:00:00+09:00",
+            "remind_at": None,
+            "timezone": None,
+            "calendar_provider": None,
+            "calendar_id": None,
+            "calendar_event_id": None,
+            "chat_id": None,
+            "source_message_id": None,
+            "metadata": {"source": "chat"},
+        },
+    }
+
+    list_response = client.get(
+        "/todos?status=open&include_deleted=true&limit=10",
+        headers=auth_headers(),
+    )
+    assert list_response.status_code == 200
+    assert stub_core_client.last_todo_request == {
+        "method": "list",
+        "user_id": "u1",
+        "status": "open",
+        "include_deleted": True,
+        "limit": 10,
+    }
+
+    get_response = client.get("/todos/todo-1", headers=auth_headers())
+    assert get_response.status_code == 200
+    assert stub_core_client.last_todo_request == {
+        "method": "get",
+        "user_id": "u1",
+        "todo_id": "todo-1",
+    }
+
+    update_response = client.patch(
+        "/todos/todo-1",
+        json={"status": "completed"},
+        headers=auth_headers(),
+    )
+    assert update_response.status_code == 200
+    assert stub_core_client.last_todo_request == {
+        "method": "update",
+        "user_id": "u1",
+        "todo_id": "todo-1",
+        "body": {"status": "completed"},
+    }
+
+    delete_response = client.delete("/todos/todo-1", headers=auth_headers())
+    assert delete_response.status_code == 200
+    assert stub_core_client.last_todo_request == {
+        "method": "delete",
+        "user_id": "u1",
+        "todo_id": "todo-1",
+    }
 
 
 def test_chat_request_can_escalate_to_deep() -> None:
@@ -564,8 +959,9 @@ def test_fast_direct_action_runs_after_realtime_starts(monkeypatch) -> None:
     body = response.text
     assert "event: action_dispatch" in body
     assert "event: assistant_delta" in body
-    assert "진행하겠습니다!" in body
-    assert body.index("진행하겠습니다!") < body.index("event: action_dispatch")
+    assert "진행하겠습니다!" not in body
+    assert "요청한 작업을 실행했습니다." in body
+    assert body.index("event: action_result") < body.index("요청한 작업을 실행했습니다.")
 
 
 def test_action_candidate_waits_past_short_done_grace(monkeypatch) -> None:
@@ -765,8 +1161,8 @@ def test_direct_action_ready_at_done_emits_before_assistant_done(monkeypatch) ->
     assert "event: assistant_delta" in body
     assert "event: action_dispatch" in body
     assert "event: assistant_done" in body
-    assert "진행하겠습니다!" in body
-    assert body.index("진행하겠습니다!") < body.index("event: action_dispatch")
+    assert "진행하겠습니다!" not in body
+    assert "요청한 작업을 실행했습니다." in body
     assert body.index("event: action_dispatch") < body.index("event: assistant_done")
 
 
@@ -844,8 +1240,9 @@ def test_action_ack_done_waits_for_recovery_dispatch(monkeypatch) -> None:
     body = response.text
     assert "event: action_dispatch" in body
     assert "action_decision_timeout" not in body
-    assert body.count("진행하겠습니다!") == 1
-    assert body.index("진행하겠습니다!") < body.index("event: action_dispatch")
+    assert "진행하겠습니다!" not in body
+    assert "요청한 작업을 실행했습니다." in body
+    assert body.index("event: action_result") < body.index("요청한 작업을 실행했습니다.")
 
 
 def test_stream_realtime_emits_text_plan_step_progress(monkeypatch) -> None:
@@ -1073,6 +1470,103 @@ def test_client_action_result_updates_backend_action_state() -> None:
     assert latest_result is not None
     assert latest_result.action_type == "open_url"
     assert latest_result.output["opened"] == "https://www.google.com/search?q=openai"
+
+
+def test_action_dispatcher_cancel_request_rejects_pending_action() -> None:
+    envelope = client.app.state.action_dispatcher.enqueue(
+        user_id="u1",
+        request_id="req-client-action-cancel",
+        action=ClientAction(
+            type="browser",
+            command="open",
+            target=None,
+            args={"browser": "chrome"},
+            description="Open browser",
+            requires_confirm=False,
+        ),
+    )
+
+    cancelled = client.app.state.action_dispatcher.cancel_request(
+        user_id="u1",
+        request_id="req-client-action-cancel",
+        reason="barge_in",
+    )
+
+    assert cancelled == 1
+    result = client.app.state.action_dispatcher.wait_for_result(
+        action_id=envelope.action_id,
+        request_id="req-client-action-cancel",
+        timeout_seconds=0.01,
+    )
+    assert result.status == "rejected"
+    assert result.error == "cancelled: barge_in"
+    assert result.output["cancelled"] is True
+
+
+def test_conversation_cancel_endpoint_cancels_pending_action() -> None:
+    envelope = client.app.state.action_dispatcher.enqueue(
+        user_id="u1",
+        request_id="req-conversation-cancel",
+        action=ClientAction(
+            type="open_url",
+            command=None,
+            target="https://www.google.com/search?q=test",
+            args={"browser": "chrome", "query": "test"},
+            description="Search browser",
+            requires_confirm=False,
+        ),
+    )
+
+    response = client.post(
+        "/conversation/cancel",
+        json={"request_id": "req-conversation-cancel", "reason": "barge_in"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["cancelled"] is True
+    assert payload["request_id"] == "req-conversation-cancel"
+    assert payload["cancelled_actions"] == 1
+    result = client.app.state.action_dispatcher.wait_for_result(
+        action_id=envelope.action_id,
+        request_id="req-conversation-cancel",
+        timeout_seconds=0.01,
+    )
+    assert result.status == "rejected"
+    assert result.output["reason"] == "barge_in"
+
+
+def test_conversation_stream_cancels_previous_turn_actions() -> None:
+    store = client.app.state.turn_cancellation
+    store.begin_turn(user_id="u1", request_id="req-old-turn", reason="barge_in")
+    envelope = client.app.state.action_dispatcher.enqueue(
+        user_id="u1",
+        request_id="req-old-turn",
+        action=ClientAction(
+            type="browser",
+            command="open",
+            target=None,
+            args={"browser": "chrome"},
+            description="Open browser",
+            requires_confirm=False,
+        ),
+    )
+
+    response = client.post(
+        "/conversation/stream",
+        json={"message": "안녕?"},
+        headers={**auth_headers(), "x-request-id": "req-new-turn"},
+    )
+
+    assert response.status_code == 200
+    result = client.app.state.action_dispatcher.wait_for_result(
+        action_id=envelope.action_id,
+        request_id="req-old-turn",
+        timeout_seconds=0.01,
+    )
+    assert result.status == "rejected"
+    assert store.cancellation(user_id="u1", request_id="req-old-turn") is not None
 
 
 def test_client_screenshot_result_updates_latest_observation_state() -> None:
@@ -1472,6 +1966,43 @@ def test_action_context_trims_large_application_list_to_message_mentions() -> No
     assert trimmed["available_application_names"] == ["Sublime Text"]
 
 
+def test_local_app_type_request_opens_app_and_types_exact_text() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "sublimetext에 안녕하세요 작성해줘",
+        context={
+            "capabilities": ["app.open", "keyboard.type"],
+            "available_applications": ["Sublime Text"],
+            "available_application_names": ["Sublime Text"],
+        },
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct_sequence"
+    assert decision.intent == "app.open+keyboard.type"
+    assert [action.type for action in decision.actions] == ["app_control", "keyboard_type"]
+    assert decision.actions[0].target == "Sublime Text"
+    assert decision.actions[1].payload == "안녕하세요"
+
+
+def test_local_app_type_request_strips_korean_quote_marker() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "sublimetext에 안녕하세요라고 작성해줘",
+        context={
+            "capabilities": ["app.open", "keyboard.type"],
+            "available_applications": ["Sublime Text"],
+            "available_application_names": ["Sublime Text"],
+        },
+    )
+
+    assert decision is not None
+    assert decision.actions[1].payload == "안녕하세요"
+
+
 def test_action_context_trims_large_application_list_to_app_metadata_match() -> None:
     from router.router import _trim_action_context_for_message
 
@@ -1503,11 +2034,86 @@ def test_action_context_trims_large_application_list_to_app_metadata_match() -> 
     assert trimmed["available_application_names"] == ["Weather"]
 
 
+def test_action_context_trims_string_app_list_using_local_alias_profile() -> None:
+    from router.router import _trim_action_context_for_message
+
+    context = {
+        "available_applications": [
+            "Weather",
+            *[f"App {index}" for index in range(40)],
+        ],
+        "available_application_names": [
+            "Weather",
+            *[f"App {index}" for index in range(40)],
+        ],
+    }
+
+    trimmed = _trim_action_context_for_message(context, "오늘 날씨 어때?")
+
+    assert trimmed is not None
+    assert trimmed["available_applications"] == ["Weather"]
+    assert trimmed["available_application_names"] == ["Weather"]
+
+
 def test_weather_question_opens_weather_app_first() -> None:
     from router.router import _local_direct_action_decision
 
     context = {
         "capabilities": ["app.open", "browser.search"],
+        "available_applications": [
+            {
+                "name": "Weather",
+                "aliases": ["weather", "날씨"],
+                "bundle_id": "com.apple.weather",
+                "capabilities": ["weather", "forecast", "예보"],
+            }
+        ],
+    }
+
+    decision = _local_direct_action_decision("오늘 날씨 알려줘", context=context)
+
+    assert decision is not None
+    assert decision.intent == "app.open"
+    assert decision.actions[0].type == "app_control"
+    assert decision.actions[0].command == "open"
+    assert decision.actions[0].target == "Weather"
+
+
+def test_weather_question_opens_weather_app_from_string_app_list() -> None:
+    from router.router import _local_direct_action_decision, _trim_action_context_for_message
+
+    context = {
+        "capabilities": ["app.open", "browser.search"],
+        "available_applications": [
+            "Weather",
+            *[f"App {index}" for index in range(40)],
+        ],
+        "available_application_names": [
+            "Weather",
+            *[f"App {index}" for index in range(40)],
+        ],
+    }
+    trimmed = _trim_action_context_for_message(context, "오늘 날씨 어때?")
+
+    decision = _local_direct_action_decision("오늘 날씨 어때?", context=trimmed)
+
+    assert decision is not None
+    assert decision.intent == "app.open"
+    assert decision.actions[0].type == "app_control"
+    assert decision.actions[0].command == "open"
+    assert decision.actions[0].target == "Weather"
+
+
+def test_weather_question_opens_weather_app_with_unrelated_browser_context() -> None:
+    from router.router import _local_direct_action_decision
+
+    context = {
+        "capabilities": ["app.open", "browser.search"],
+        "browser_active": True,
+        "latest_action_result": {
+            "action_type": "open_url",
+            "target": "https://www.google.com/search?q=test",
+        },
         "available_applications": [
             {
                 "name": "Weather",
@@ -1744,6 +2350,317 @@ def test_terminal_run_request_dispatches_confirmed_terminal_action() -> None:
     assert action.requires_confirm is True
 
 
+def test_terminal_run_request_accepts_cmd_alias_for_pwd() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "CMD에서 PWD 수행해줘",
+        context={
+            "capabilities": ["terminal.run"],
+            "terminal": {"enabled": True, "allowed_commands": ["pwd"]},
+        },
+    )
+
+    assert decision is not None
+    assert decision.intent == "terminal.run"
+    assert decision.actions[0].payload == "PWD"
+    assert decision.actions[0].args["command"] == "PWD"
+
+
+def test_browser_search_with_cmd_query_is_not_terminal_command() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "브라우저에서 cmd에 대해 검색해줘",
+        context={
+            "capabilities": ["terminal.run", "open_url", "browser.search"],
+            "terminal": {
+                "enabled": True,
+                "shell": "zsh",
+                "cwd": "/Users/chawonje/Desktop/Workspace/project/JARVIS",
+                "allowed_commands": ["pwd"],
+            },
+        },
+    )
+
+    assert decision is not None
+    assert decision.intent == "browser.search"
+    action = decision.actions[0]
+    assert action.type == "open_url"
+    assert action.args["query"] == "cmd"
+    assert action.target is not None
+    assert "q=cmd" in action.target
+
+
+def test_browser_search_strips_trailing_browser_open_framing() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "매콤한 소불고기 레시피 브라우저 켜서 찾아줘",
+        context={"capabilities": ["open_url", "browser.search", "browser.open"]},
+    )
+
+    assert decision is not None
+    assert decision.intent == "browser.search"
+    action = decision.actions[0]
+    assert action.type == "open_url"
+    assert action.args["query"] == "매콤한 소불고기 레시피"
+    assert action.target is not None
+    assert "%EB%A7%A4%EC%BD%A4%ED%95%9C" in action.target
+
+
+def test_explicit_search_without_browser_word_dispatches_browser_search() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "OpenAI 최신 소식 검색해줘",
+        context={"capabilities": ["open_url", "browser.search"]},
+    )
+
+    assert decision is not None
+    assert decision.intent == "browser.search"
+    action = decision.actions[0]
+    assert action.type == "open_url"
+    assert action.args["query"] == "OpenAI 최신 소식"
+    assert action.target is not None
+    assert "OpenAI" in action.target
+
+
+def test_explicit_search_strips_trailing_topic_relation() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "창원대학교 박동규 교수님애 대해서 검색해줘",
+        context={"capabilities": ["open_url", "browser.search"]},
+    )
+
+    assert decision is not None
+    assert decision.intent == "browser.search"
+    action = decision.actions[0]
+    assert action.type == "open_url"
+    assert action.args["query"] == "창원대학교 박동규 교수님"
+    assert action.target is not None
+    assert "%EC%B0%BD%EC%9B%90%EB%8C%80%ED%95%99%EA%B5%90" in action.target
+
+
+def test_bare_browser_search_without_previous_topic_is_not_dispatched() -> None:
+    from router.router import _local_direct_action_decision
+
+    context = {"capabilities": ["open_url", "browser.search"]}
+
+    assert _local_direct_action_decision("브라우저에서 검색해줘", context=context) is None
+    assert _local_direct_action_decision("검색해줘", context=context) is None
+
+
+def test_action_architecture_question_is_not_terminal_action() -> None:
+    from planner.conversation_routing import ConversationContext, evaluate_conversation_mode
+    from router.router import _local_direct_action_decision
+
+    message = (
+        "현재 앱 실행, 브라우저 검색, 터미널 실행 액션이 충돌하지 않도록 "
+        "라우팅 우선순위를 설계해줘"
+    )
+
+    assert _local_direct_action_decision(
+        message,
+        context={"capabilities": ["terminal.run", "browser.search"]},
+    ) is None
+    decision = evaluate_conversation_mode(message, context=ConversationContext())
+    assert decision.mode.value == "deep"
+
+
+def test_calendar_todo_architecture_question_routes_deep() -> None:
+    from planner.conversation_routing import ConversationContext, evaluate_conversation_mode
+
+    decision = evaluate_conversation_mode(
+        (
+            "todo 기능을 구글 캘린더 연동까지 고려해서 "
+            "백엔드/프론트/DB/API 설계로 나눠서 제안해줘"
+        ),
+        context=ConversationContext(),
+    )
+
+    assert decision.mode.value == "deep"
+
+
+def test_stream_action_architecture_question_uses_deep_chat_without_action_gate() -> None:
+    stub_core_client.last_chat_stream_request = None
+    message = (
+        "앱 실행, 브라우저 검색, 터미널 실행 액션이 충돌하지 않도록 "
+        "라우팅 우선순위를 설계해줘"
+    )
+
+    response = client.post(
+        "/conversation/stream",
+        json={"message": message},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    events = _collect_events(response.text)
+    event_names = [event for event, _payload in events]
+    assert "classification" in event_names
+    assert "plan_summary" not in event_names
+    assert "action_intent" not in event_names
+    assert "action_dispatch" not in event_names
+    assert stub_core_client.last_chat_stream_request is not None
+    assert stub_core_client.last_chat_stream_request["route_override"] == "deep"
+    assert stub_core_client.last_chat_stream_request["task_type"] == "analysis"
+
+
+def test_stream_calendar_todo_architecture_question_uses_deep_chat() -> None:
+    stub_core_client.last_chat_stream_request = None
+    message = (
+        "todo 기능을 구글 캘린더 연동까지 고려해서 "
+        "백엔드/프론트/DB/API 설계로 나눠서 제안해줘"
+    )
+
+    response = client.post(
+        "/conversation/stream",
+        json={"message": message},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    events = _collect_events(response.text)
+    event_names = [event for event, _payload in events]
+    assert "classification" in event_names
+    assert "plan_summary" not in event_names
+    assert "action_dispatch" not in event_names
+    assert stub_core_client.last_chat_stream_request is not None
+    assert stub_core_client.last_chat_stream_request["route_override"] == "deep"
+    assert stub_core_client.last_chat_stream_request["task_type"] == "analysis"
+
+
+def test_stream_code_output_request_uses_deep_chat() -> None:
+    stub_core_client.last_chat_stream_request = None
+    message = "FastAPI에서 SSE 스트림 보내는 예제 코드 제공해줘"
+
+    response = client.post(
+        "/conversation/stream",
+        json={"message": message},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    events = _collect_events(response.text)
+    event_names = [event for event, _payload in events]
+    assert "classification" in event_names
+    assert "action_dispatch" not in event_names
+    assert stub_core_client.last_chat_stream_request is not None
+    assert stub_core_client.last_chat_stream_request["route_override"] == "deep"
+    assert stub_core_client.last_chat_stream_request["task_type"] == "analysis"
+
+
+def test_stream_without_leading_action_ack_removes_split_ack_prefix() -> None:
+    from router.router import _stream_without_leading_action_ack
+
+    chunks = iter(
+        [
+            b'event: assistant_delta\ndata: {"content":"\xec\xa7\x84"}\n\n',
+            b'event: assistant_delta\ndata: {"content":"\xed\x96\x89"}\n\n',
+            (
+                b'event: assistant_delta\ndata: {"content":"'
+                b'\xed\x95\x98\xea\xb2\xa0\xec\x8a\xb5\xeb\x8b\x88'
+                b'\xeb\x8b\xa4!"}\n\n'
+            ),
+            b'event: assistant_delta\ndata: {"content":" 1. design"}\n\n',
+        ]
+    )
+
+    body = b"".join(_stream_without_leading_action_ack(chunks)).decode()
+
+    assert "진행하겠습니다" not in body
+    assert "1. design" in body
+
+
+def test_browser_search_followup_uses_previous_user_message_topic() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "브라우저에서 찾아줘",
+        context={
+            "capabilities": ["open_url", "browser.search"],
+            "previous_user_message": {"text": "남은 반찬 처리하는법 찾아줘"},
+        },
+    )
+
+    assert decision is not None
+    assert decision.intent == "browser.search"
+    action = decision.actions[0]
+    assert action.type == "open_url"
+    assert action.args["query"] == "남은 반찬 처리하는법"
+    assert action.target is not None
+    assert "%EB%82%A8%EC%9D%80+%EB%B0%98%EC%B0%AC" in action.target
+
+
+def test_stream_browser_search_followup_uses_last_turn_topic() -> None:
+    client.app.state.recent_user_messages = {}
+
+    first_response = client.post(
+        "/conversation/stream",
+        json={"message": "남은 반찬 처리하는법 찾아줘"},
+        headers=auth_headers(),
+    )
+    assert first_response.status_code == 200
+
+    followup_response = client.post(
+        "/conversation/stream",
+        json={"message": "브라우저에서 찾아줘"},
+        headers=auth_headers(),
+    )
+
+    assert followup_response.status_code == 200
+    body = followup_response.text
+    assert '"intent": "browser.search"' in body
+    assert '"query": "남은 반찬 처리하는법"' in body
+    assert "%EB%82%A8%EC%9D%80+%EB%B0%98%EC%B0%AC" in body
+
+
+def test_stream_previous_question_recall_uses_last_user_message() -> None:
+    client.app.state.recent_user_messages = {}
+
+    first_response = client.post(
+        "/conversation/stream",
+        json={"message": "남은 반찬 처리하는법 찾아줘"},
+        headers=auth_headers(),
+    )
+    assert first_response.status_code == 200
+    stub_core_client.last_chat_stream_request = None
+
+    recall_response = client.post(
+        "/conversation/stream",
+        json={"message": "이전 질문 내가 뭐라했어?"},
+        headers=auth_headers(),
+    )
+
+    assert recall_response.status_code == 200
+    body = recall_response.text
+    assert "이전 질문은" in body
+    assert "남은 반찬 처리하는법 찾아줘" in body
+    assert "local previous user message recall" in body
+    assert stub_core_client.last_chat_stream_request is None
+
+
+def test_terminal_run_request_dispatches_explicit_command_for_client_policy() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "터미널에서 ssh breakpack@Mymacmini 실행해줘",
+        context={
+            "capabilities": ["terminal.run"],
+            "terminal": {"enabled": True, "allowed_commands": ["pwd"]},
+        },
+    )
+
+    assert decision is not None
+    assert decision.intent == "terminal.run"
+    action = decision.actions[0]
+    assert action.payload == "ssh breakpack@Mymacmini"
+    assert action.args["command"] == "ssh breakpack@Mymacmini"
+    assert action.requires_confirm is True
+
+
 def test_terminal_run_request_respects_disabled_terminal_context() -> None:
     from router.router import _local_direct_action_decision
 
@@ -1756,6 +2673,275 @@ def test_terminal_run_request_respects_disabled_terminal_context() -> None:
     )
 
     assert decision is None
+
+
+def test_todo_create_request_dispatches_server_todo_action() -> None:
+    stub_core_client.last_todo_request = None
+
+    response = client.post(
+        "/conversation/stream",
+        json={"message": "컴파일러 과제 5/18 23:59 까지 할일에 추가해 줄래?"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert '"intent": "todo.create"' in body
+    assert "event: action_dispatch" not in body
+    assert "event: action_result" in body
+    assert '"source": "server_todo"' in body
+    assert "요청한 작업을 실행했습니다." in body
+    assert stub_core_client.last_todo_request is not None
+    assert stub_core_client.last_todo_request["method"] == "create"
+    assert stub_core_client.last_todo_request["user_id"] == "u1"
+    todo_body = stub_core_client.last_todo_request["body"]
+    assert isinstance(todo_body, dict)
+    assert todo_body["title"] == "컴파일러 과제"
+    assert str(todo_body["due_at"]).endswith("-05-18T23:59:00+09:00")
+    assert todo_body["timezone"] == "Asia/Seoul"
+
+
+def test_todo_create_request_extracts_relative_day_time_and_clean_title() -> None:
+    stub_core_client.last_todo_request = None
+
+    response = client.post(
+        "/conversation/stream",
+        json={"message": "할일 목록에 오늘 오후 8시 미팅 추가해줘"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert '"intent": "todo.create"' in body
+    assert '"title": "미팅"' in body
+    assert stub_core_client.last_todo_request is not None
+    todo_body = stub_core_client.last_todo_request["body"]
+    assert isinstance(todo_body, dict)
+    assert todo_body["title"] == "미팅"
+    assert str(todo_body["due_at"]).endswith("T20:00:00+09:00")
+
+
+def test_todo_list_request_dispatches_server_todo_list_action() -> None:
+    stub_core_client.last_todo_request = None
+
+    response = client.post(
+        "/conversation/stream",
+        json={"message": "남은 할일 뭐남았어?"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert '"intent": "todo.list"' in body
+    assert "event: action_dispatch" not in body
+    assert "event: action_result" in body
+    assert '"source": "server_todo"' in body
+    assert "남은 할 일입니다." in body
+    assert "테스트 todo" in body
+    assert stub_core_client.last_todo_request == {
+        "method": "list",
+        "user_id": "u1",
+        "status": "open",
+        "include_deleted": False,
+        "limit": 50,
+    }
+
+
+def test_todo_today_list_filters_server_results(monkeypatch) -> None:
+    today = datetime.now(ZoneInfo("Asia/Seoul"))
+    tomorrow = today + timedelta(days=1)
+
+    def fake_list_todos(
+        *,
+        user_id: str,
+        status: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 50,
+    ) -> dict[str, object]:
+        return {
+            "items": [
+                {
+                    "id": "todo-today",
+                    "user_id": user_id,
+                    "title": "오늘 회의",
+                    "status": status or "open",
+                    "due_at": today.isoformat(),
+                },
+                {
+                    "id": "todo-future",
+                    "user_id": user_id,
+                    "title": "내일 회의",
+                    "status": status or "open",
+                    "due_at": tomorrow.isoformat(),
+                },
+            ]
+        }
+
+    monkeypatch.setattr(stub_core_client, "list_todos", fake_list_todos)
+
+    response = client.post(
+        "/conversation/stream",
+        json={"message": "오늘 할일 알려줘"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "오늘 회의" in body
+    assert "내일 회의" not in body
+
+
+def test_free_time_check_lists_today_todos_and_summarizes_slots(monkeypatch) -> None:
+    today = datetime.now(ZoneInfo("Asia/Seoul"))
+
+    def fake_list_todos(
+        *,
+        user_id: str,
+        status: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 50,
+    ) -> dict[str, object]:
+        return {
+            "items": [
+                {
+                    "id": "todo-morning",
+                    "user_id": user_id,
+                    "title": "오전 회의",
+                    "status": status or "open",
+                    "due_at": today.replace(hour=10, minute=0, second=0).isoformat(),
+                },
+                {
+                    "id": "todo-afternoon",
+                    "user_id": user_id,
+                    "title": "오후 리뷰",
+                    "status": status or "open",
+                    "due_at": today.replace(hour=15, minute=0, second=0).isoformat(),
+                },
+            ]
+        }
+
+    monkeypatch.setattr(stub_core_client, "list_todos", fake_list_todos)
+
+    response = client.post(
+        "/conversation/stream",
+        json={"message": "오늘 빈시간 체크해줘"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert '"intent": "todo.list"' in body
+    assert '"summary_mode": "free_time"' in body
+    assert "오늘 할 일 목록 기준 빈 시간입니다." in body
+    assert "10:00-14:00" in body
+    assert "15:00-18:00" in body
+
+
+def test_free_time_check_reports_result_after_empty_todo_action(monkeypatch) -> None:
+    def fake_list_todos(
+        *,
+        user_id: str,
+        status: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 50,
+    ) -> dict[str, object]:
+        return {"items": []}
+
+    monkeypatch.setattr(stub_core_client, "list_todos", fake_list_todos)
+
+    response = client.post(
+        "/conversation/stream",
+        json={"message": "오늘 빈시간 알려줘"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "진행하겠습니다!" not in body
+    assert body.index("event: action_result") < body.index(
+        "오늘 등록된 시간 지정 할 일이 없습니다."
+    )
+    events = _collect_events(body)
+    done_payloads = [
+        payload for event_name, payload in events if event_name == "assistant_done"
+    ]
+    assert done_payloads[-1]["content"] == (
+        "오늘 등록된 시간 지정 할 일이 없습니다. 09:00-18:00 전체가 비어 있습니다."
+    )
+
+
+def test_todo_delete_request_deletes_single_matching_server_todo(monkeypatch) -> None:
+    today = datetime.now(ZoneInfo("Asia/Seoul")).replace(
+        hour=18,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    calls: list[tuple[str, object]] = []
+
+    def fake_list_todos(
+        *,
+        user_id: str,
+        status: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 50,
+    ) -> dict[str, object]:
+        calls.append(("list", {"user_id": user_id, "status": status, "limit": limit}))
+        return {
+            "items": [
+                {
+                    "id": "todo-meeting",
+                    "user_id": user_id,
+                    "title": "미팅",
+                    "status": status or "open",
+                    "due_at": today.isoformat(),
+                },
+                {
+                    "id": "todo-other",
+                    "user_id": user_id,
+                    "title": "다른 할 일",
+                    "status": status or "open",
+                    "due_at": today.replace(hour=21).isoformat(),
+                },
+            ]
+        }
+
+    def fake_delete_todo(*, user_id: str, todo_id: str) -> dict[str, object]:
+        calls.append(("delete", todo_id))
+        return {"id": todo_id, "deleted": True}
+
+    monkeypatch.setattr(stub_core_client, "list_todos", fake_list_todos)
+    monkeypatch.setattr(stub_core_client, "delete_todo", fake_delete_todo)
+
+    response = client.post(
+        "/conversation/stream",
+        json={"message": "오늘 6시 미팅 삭제해줘"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert '"intent": "todo.delete"' in body
+    assert "event: action_dispatch" not in body
+    assert '"source": "server_todo"' in body
+    assert "요청한 작업을 실행했습니다." in body
+    assert ("delete", "todo-meeting") in calls
+
+
+def test_todo_remove_synonym_routes_to_delete_before_list() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "오후 5시 미팅 할일 목록에서 없애줘",
+        context={},
+    )
+
+    assert decision is not None
+    assert decision.intent == "todo.delete"
+    action = decision.actions[0]
+    assert action.command == "delete"
+    assert action.args["query"] == "미팅"
+    assert action.args["due_hours"] == [17]
 
 
 def test_runtime_profile_llm_enrichment_adds_app_aliases(monkeypatch) -> None:

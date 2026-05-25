@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Generator
+from datetime import datetime, time, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from jarvis_contracts import ClientAction
 
@@ -86,6 +88,9 @@ def action_completion_message(
     statuses = [str(item.get("status") or "") for item in action_results]
     completed_count = len([status for status in statuses if status == "completed"])
     if completed_count == len(action_results):
+        todo_list_content = _todo_list_completion_content(action_results)
+        if todo_list_content:
+            return todo_list_content, "server todo list completed"
         return success_content, success_summary
 
     first_error = _first_action_error(action_results)
@@ -137,6 +142,159 @@ def _first_action_error(action_results: list[dict[str, object]]) -> str:
     return "상세 오류가 전달되지 않았습니다."
 
 
+def _todo_list_completion_content(
+    action_results: list[dict[str, object]],
+) -> str | None:
+    if len(action_results) != 1:
+        return None
+    action_result = action_results[0]
+    action = action_result.get("action")
+    output = action_result.get("output")
+    if not isinstance(action, dict) or not isinstance(output, dict):
+        return None
+    if action.get("type") != "todo" or action.get("command") != "list":
+        return None
+    if output.get("source") != "server_todo":
+        return None
+    result = output.get("result")
+    if not isinstance(result, dict):
+        return None
+    action_args = action.get("args")
+    if isinstance(action_args, dict) and action_args.get("summary_mode") == "free_time":
+        return _todo_free_time_completion_content(result, action_args)
+    items = result.get("items")
+    if not isinstance(items, list):
+        return None
+    if not items:
+        return "남은 할 일이 없습니다."
+    lines = ["남은 할 일입니다."]
+    for index, item in enumerate(items[:20], start=1):
+        if not isinstance(item, dict):
+            continue
+        title = item.get("title")
+        if not isinstance(title, str) or not title.strip():
+            title = str(item.get("id") or f"할 일 {index}")
+        due_at = item.get("due_at")
+        suffix = f" - {due_at}" if isinstance(due_at, str) and due_at.strip() else ""
+        lines.append(f"{index}. {title}{suffix}")
+    if len(items) > 20:
+        lines.append(f"외 {len(items) - 20}개가 더 있습니다.")
+    return "\n".join(lines)
+
+
+def _todo_free_time_completion_content(
+    result: dict[str, object],
+    args: dict[str, object],
+) -> str:
+    items = result.get("items")
+    if not isinstance(items, list):
+        return "할 일 목록을 확인했지만 빈 시간을 계산할 수 없습니다."
+    timezone = _timezone_from_args(args)
+    intervals = sorted(
+        interval
+        for item in items
+        if isinstance(item, dict)
+        for interval in [_todo_busy_interval(item, timezone=timezone)]
+        if interval is not None
+    )
+    merged = _merge_intervals(intervals)
+    day_start = datetime.combine(datetime.now(timezone).date(), time(9, 0), timezone)
+    day_end = datetime.combine(datetime.now(timezone).date(), time(18, 0), timezone)
+    free_slots = _free_intervals(merged, day_start=day_start, day_end=day_end)
+    if not intervals:
+        return "오늘 등록된 시간 지정 할 일이 없습니다. 09:00-18:00 전체가 비어 있습니다."
+    if not free_slots:
+        return "오늘 할 일 목록을 확인했습니다. 09:00-18:00 사이에 뚜렷한 빈 시간이 없습니다."
+    lines = ["오늘 할 일 목록 기준 빈 시간입니다."]
+    for start, end in free_slots:
+        lines.append(f"- {start:%H:%M}-{end:%H:%M}")
+    return "\n".join(lines)
+
+
+def _todo_busy_interval(
+    item: dict[str, object],
+    *,
+    timezone: ZoneInfo,
+) -> tuple[datetime, datetime] | None:
+    due_at = item.get("due_at")
+    if not isinstance(due_at, str) or not due_at.strip():
+        return None
+    value = due_at.strip()
+    if value.endswith("Z"):
+        value = f"{value[:-1]}+00:00"
+    try:
+        end = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone)
+    end = end.astimezone(timezone)
+    duration_minutes = _duration_minutes(item)
+    start = end.replace(minute=0, second=0, microsecond=0)
+    if duration_minutes > 0:
+        start = end - timedelta(minutes=duration_minutes)
+    return start, end
+
+
+def _duration_minutes(item: dict[str, object]) -> int:
+    value = item.get("duration_minutes")
+    if isinstance(value, int) and value > 0:
+        return min(value, 24 * 60)
+    metadata = item.get("metadata")
+    if isinstance(metadata, dict):
+        metadata_value = metadata.get("duration_minutes")
+        if isinstance(metadata_value, int) and metadata_value > 0:
+            return min(metadata_value, 24 * 60)
+    return 60
+
+
+def _merge_intervals(
+    intervals: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    merged: list[tuple[datetime, datetime]] = []
+    for start, end in intervals:
+        if end <= start:
+            continue
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        if end > merged[-1][1]:
+            merged[-1] = (merged[-1][0], end)
+    return merged
+
+
+def _free_intervals(
+    busy: list[tuple[datetime, datetime]],
+    *,
+    day_start: datetime,
+    day_end: datetime,
+) -> list[tuple[datetime, datetime]]:
+    free: list[tuple[datetime, datetime]] = []
+    cursor = day_start
+    for start, end in busy:
+        clipped_start = max(start, day_start)
+        clipped_end = min(end, day_end)
+        if clipped_end <= day_start or clipped_start >= day_end:
+            continue
+        if clipped_start > cursor:
+            free.append((cursor, clipped_start))
+        if clipped_end > cursor:
+            cursor = clipped_end
+    if cursor < day_end:
+        free.append((cursor, day_end))
+    return free
+
+
+def _timezone_from_args(args: dict[str, object]) -> ZoneInfo:
+    value = args.get("timezone")
+    if isinstance(value, str) and value.strip():
+        try:
+            return ZoneInfo(value.strip())
+        except Exception:
+            pass
+    return ZoneInfo("Asia/Seoul")
+
+
 def stream_dispatched_actions(
     *,
     actions: list[ClientAction],
@@ -173,6 +331,17 @@ def stream_dispatched_actions(
         success_content=done_content,
         success_summary=done_summary,
     )
+    if content:
+        yield sse_event(
+            "assistant_delta",
+            {
+                "content": content,
+                "summary": summary,
+                "has_actions": True,
+                "action_count": len(action_results),
+                "action_results": action_results,
+            },
+        )
     yield sse_event(
         "assistant_done",
         {
@@ -209,16 +378,22 @@ def stream_action_dispatch_events(
             action=action,
         )
         action_id = envelope.action_id or fallback_action_id
-        yield sse_event(
-            "plan_step",
-            _action_plan_step_payload(
-                action,
-                action_id=action_id,
-                status="queued",
-                request_id=request_id,
-            ),
+        ready_result = _ready_server_action_result(
+            action_dispatcher=action_dispatcher,
+            action_id=envelope.action_id,
+            request_id=request_id,
         )
-        yield sse_event("action_dispatch", envelope.model_dump())
+        if ready_result is None:
+            yield sse_event(
+                "plan_step",
+                _action_plan_step_payload(
+                    action,
+                    action_id=action_id,
+                    status="queued",
+                    request_id=request_id,
+                ),
+            )
+            yield sse_event("action_dispatch", envelope.model_dump())
         yield sse_event(
             "plan_step",
             _action_plan_step_payload(
@@ -228,7 +403,7 @@ def stream_action_dispatch_events(
                 request_id=request_id,
             ),
         )
-        action_result = action_dispatcher.wait_for_result(
+        action_result = ready_result or action_dispatcher.wait_for_result(
             action_id=envelope.action_id,
             request_id=request_id,
             timeout_seconds=action_result_timeout_seconds(action),
@@ -269,6 +444,18 @@ def stream_action_dispatch_events(
         )
         if follow_up is not None:
             pending_actions.append(follow_up)
+
+
+def _ready_server_action_result(
+    *,
+    action_dispatcher: Any,
+    action_id: str,
+    request_id: str,
+) -> Any | None:
+    result_if_ready = getattr(action_dispatcher, "result_if_ready", None)
+    if not callable(result_if_ready):
+        return None
+    return result_if_ready(action_id=action_id, request_id=request_id)
 
 
 def dispatch_actions_sync(

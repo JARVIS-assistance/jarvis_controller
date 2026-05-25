@@ -241,6 +241,126 @@ def test_action_compiler_normalizes_browser_search_query_from_gate(
     assert decision.actions[0].args["query"] == "소불고기 레시피"
 
 
+def test_action_compiler_recovers_search_when_gate_returns_no_action(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+
+    def fake_post_json(url, payload, *, timeout):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": False,
+                                "intent": "none",
+                                "template_key": None,
+                                "slots": {},
+                                "confidence": 0.95,
+                                "reason": "model missed explicit search",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="OpenAI 최신 소식 검색해줘",
+        context={"capabilities": ["browser.search"]},
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "open_url"
+    assert decision.actions[0].args["query"] == "OpenAI 최신 소식"
+
+
+def test_action_compiler_recovers_search_query_when_gate_slot_is_missing(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+
+    def fake_post_json(url, payload, *, timeout):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": True,
+                                "intent": "browser.search",
+                                "template_key": "browser_search",
+                                "slots": {},
+                                "confidence": 0.95,
+                                "reason": "search request without extracted query",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="요즘 인기있는 AI 뉴스 검색해줘",
+        context={"capabilities": ["browser.search"]},
+    )
+
+    assert decision is not None
+    assert decision.should_act is True
+    assert decision.execution_mode == "direct"
+    assert decision.actions[0].type == "open_url"
+    assert decision.actions[0].args["query"] == "요즘 인기있는 AI 뉴스"
+
+
+def test_action_compiler_keeps_missing_query_invalid_when_no_topic(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+
+    def fake_post_json(url, payload, *, timeout):
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {
+                                "should_act": True,
+                                "intent": "browser.search",
+                                "template_key": "browser_search",
+                                "slots": {},
+                                "confidence": 0.95,
+                                "reason": "search request without extracted query",
+                            }
+                        )
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    decision = ActionCompiler().compile_decision(
+        message="검색해줘",
+        context={"capabilities": ["browser.search"]},
+    )
+
+    assert decision is not None
+    assert decision.should_act is False
+    assert decision.execution_mode == "invalid"
+    assert decision.validation_errors
+    assert decision.validation_errors[0].code == "missing_template_slot"
+
+
 def test_action_compiler_does_not_plan_compile_template_free_gate(
     monkeypatch,
 ) -> None:
@@ -835,6 +955,46 @@ def test_ollama_chat_generate_falls_back_to_wrapper_generate(monkeypatch) -> Non
         "https://ollma.breakpack.cc/chat",
         "https://ollma.breakpack.cc/api/generate",
         "https://ollma.breakpack.cc/generate",
+    ]
+
+
+def test_action_compiler_retries_ollama_chat_api_path_when_local_docker_chat_returns_400(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_ENABLED", "1")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "ollama_chat")
+    monkeypatch.setenv("JARVIS_ACTION_MODEL_ENDPOINT", "http://127.0.0.1:3030/chat")
+    monkeypatch.setenv("JARVIS_ACTION_INTENT_MODEL_NAME", "qwen2.5:1.5b")
+    monkeypatch.setattr("os.path.exists", lambda _: True)
+    calls: list[str] = []
+
+    def fake_post_json(url, payload, *, timeout):
+        calls.append(url)
+        if url.endswith("/chat"):
+            raise RuntimeError("HTTP 400 from action compiler: {\"error\":\"bad request\"}")
+        return {
+            "message": {
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "should_act": False,
+                        "intent": "none",
+                        "confidence": 0.95,
+                        "reason": "intent gate fallback",
+                    }
+                ),
+            }
+        }
+
+    monkeypatch.setattr("planner.action_compiler._post_json", fake_post_json)
+
+    gate = ActionCompiler().compile_intent_gate(message="안녕?")
+
+    assert gate is not None
+    assert gate.should_act is False
+    assert calls == [
+        "http://host.docker.internal:3030/chat",
+        "http://host.docker.internal:3030/api/chat",
     ]
 
 

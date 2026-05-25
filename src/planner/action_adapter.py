@@ -326,6 +326,21 @@ class V2ToV1ActionAdapter:
                 step_id=action.step_id,
             )
 
+        if action.name.startswith("todo."):
+            command = action.name.split(".", 1)[1]
+            payload = _string_arg(args, "title") or action.payload
+            target = _string_arg(args, "todo_id") or action.target
+            return ClientAction(
+                type="todo",
+                command=command,
+                target=target,
+                payload=payload,
+                args=dict(args),
+                description=action.description or f"Todo {command}",
+                requires_confirm=action.requires_confirm,
+                step_id=action.step_id,
+            )
+
         if action.name.startswith("calendar."):
             command = {
                 "calendar.open": "open",

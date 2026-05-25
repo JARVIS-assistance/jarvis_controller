@@ -74,6 +74,8 @@
 - `POST /auth/logout`
 - `GET /auth/me`
 - `POST /conversation/respond`
+- `POST /audio/speech`
+- `POST /audio/speech/pcm`
 - `POST /execute`
 - `POST /verify`
 

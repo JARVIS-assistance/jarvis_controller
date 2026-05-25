@@ -13,13 +13,14 @@ PostJson = Callable[[str, dict[str, Any]], dict[str, Any]]
 
 
 def action_model_endpoint() -> str:
-    return os.getenv(
+    endpoint = os.getenv(
         "JARVIS_ACTION_MODEL_ENDPOINT",
         os.getenv(
             "JARVIS_ACTION_INTENT_MODEL_ENDPOINT",
             "https://qwen.breakpack.cc/engines/v1/chat/completions",
         ),
     )
+    return _normalize_docker_local_endpoint(endpoint)
 
 
 def action_model_provider() -> str:
@@ -131,10 +132,23 @@ def complete_model_text(
 
 
 def _ollama_chat_urls(endpoint: str) -> list[str]:
-    raw = endpoint.rstrip("/")
-    path = urllib.parse.urlparse(raw).path
-    if path.endswith("/chat") or path.endswith("/api/chat"):
-        return [raw]
+    raw = _normalize_docker_local_endpoint(endpoint).rstrip("/")
+    parsed = urllib.parse.urlparse(raw)
+    path = parsed.path
+    if path.endswith("/chat"):
+        base = path.removesuffix("/chat")
+        candidates = [
+            raw,
+            urllib.parse.urlunparse(parsed._replace(path=base + "/api/chat")),
+        ]
+        return _unique_urls(candidates)
+    if path.endswith("/api/chat"):
+        base = path.removesuffix("/api/chat")
+        candidates = [
+            raw,
+            urllib.parse.urlunparse(parsed._replace(path=base + "/chat")),
+        ]
+        return _unique_urls(candidates)
     return [f"{raw}/api/chat", f"{raw}/chat"]
 
 
@@ -156,14 +170,14 @@ def _ollama_chat_payload(
     think = payload.get("think")
     if isinstance(think, bool):
         result["think"] = think
-    keep_alive = os.getenv("JARVIS_ACTION_OLLAMA_KEEP_ALIVE")
+    keep_alive = _ollama_keep_alive()
     if keep_alive:
         result["keep_alive"] = keep_alive
     return result
 
 
 def _ollama_generate_urls(endpoint: str) -> list[str]:
-    raw = endpoint.rstrip("/")
+    raw = _normalize_docker_local_endpoint(endpoint).rstrip("/")
     parsed = urllib.parse.urlparse(raw)
     path = parsed.path.rstrip("/")
     if path.endswith("/api/generate"):
@@ -183,6 +197,52 @@ def _ollama_generate_urls(endpoint: str) -> list[str]:
             urllib.parse.urlunparse(parsed._replace(path=base + "/generate")),
         ]
     return [f"{raw}/api/generate", f"{raw}/generate"]
+
+
+def _normalize_docker_local_endpoint(raw_endpoint: str) -> str:
+    if os.getenv("JARVIS_REWRITE_DOCKER_LOCALHOST", "1").lower() in {
+        "0",
+        "false",
+        "no",
+    }:
+        return raw_endpoint
+    if not os.path.exists("/.dockerenv"):
+        return raw_endpoint
+    parsed = urllib.parse.urlparse(raw_endpoint)
+    if parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        return raw_endpoint
+
+    netloc = "host.docker.internal"
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    if parsed.username or parsed.password:
+        auth = parsed.username or ""
+        if parsed.password:
+            auth = f"{auth}:{parsed.password}"
+        netloc = f"{auth}@{netloc}"
+    return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
+
+
+def _normalize_keep_alive(raw_keep_alive: str | None) -> str | None:
+    if raw_keep_alive is None:
+        return None
+    value = raw_keep_alive.strip()
+    if not value:
+        return None
+    if value.startswith("-"):
+        return None
+    return value
+
+
+def _unique_urls(urls: list[str]) -> list[str]:
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        uniq.append(url)
+    return uniq
 
 
 def _ollama_generate_payload(
@@ -208,10 +268,17 @@ def _ollama_generate_payload(
     think = payload.get("think")
     if isinstance(think, bool):
         result["think"] = think
-    keep_alive = os.getenv("JARVIS_ACTION_OLLAMA_KEEP_ALIVE")
+    keep_alive = _ollama_keep_alive()
     if keep_alive:
         result["keep_alive"] = keep_alive
     return result
+
+
+def _ollama_keep_alive() -> str | None:
+    return _normalize_keep_alive(
+        os.getenv("JARVIS_ACTION_OLLAMA_KEEP_ALIVE")
+        or os.getenv("JARVIS_OLLAMA_KEEP_ALIVE")
+    )
 
 
 def post_json_request(

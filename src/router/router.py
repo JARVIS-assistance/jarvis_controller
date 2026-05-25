@@ -2,14 +2,18 @@ import concurrent.futures
 import json
 import logging
 import os
+import queue
 import re
+import time
 from collections.abc import Generator
+from datetime import datetime, timedelta
 from typing import Annotated, Any, Literal, Optional
 from urllib.parse import quote_plus
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jarvis_contracts import (
     ClientAction,
@@ -23,14 +27,17 @@ from jarvis_contracts import (
     PlanningPayload,
     PlanStepPayload,
     PrincipalResponse,
+    TodoCreateRequest,
+    TodoUpdateRequest,
     VerifyRequest,
     action_registry_payload,
 )
 from jarvis_contracts import (
     ConversationMode as ContractConversationMode,
 )
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
+from planner.action_adapter import V2ToV1ActionAdapter
 from planner.action_intent_classifier import (
     DIRECT_EXECUTION_MODES,
     ActionIntentDecision,
@@ -52,7 +59,11 @@ from planner.action_pipeline import (
 from planner.action_pipeline import (
     stream_dispatched_actions as _stream_dispatched_actions,
 )
-from planner.action_templates import normalize_browser_search_query
+from planner.action_templates import (
+    materialize_explicit_app_open_for_text,
+    materialize_fresh_context_app_open_for_text,
+    normalize_browser_search_query,
+)
 from planner.conversation_orchestrator import orchestrate_conversation_turn
 from planner.conversation_routing import (
     ConversationContext,
@@ -68,6 +79,19 @@ logger = logging.getLogger("jarvis_controller")
 
 api_router = APIRouter()
 bearer_scheme = HTTPBearer(auto_error=False)
+LEGACY_TTS_VOICES = {
+    "alloy",
+    "ash",
+    "coral",
+    "echo",
+    "fable",
+    "onyx",
+    "nova",
+    "sage",
+    "shimmer",
+}
+PCM_DEFAULT_VOICE_ALIASES = {"", "default", "marin"}
+PCM_DEFAULT_MODEL_ALIASES = {"", "gpt-4o-mini-tts", "tts-1", "tts-1-hd"}
 _ACTION_ARBITRATION_BUFFER_SECONDS = "JARVIS_ACTION_ARBITRATION_BUFFER_SECONDS"
 _ACTION_ARBITRATION_DEFAULT_SECONDS = 0.0
 _ACTION_INTENT_CORE_FALLBACK_ENABLED = "JARVIS_ACTION_INTENT_CORE_FALLBACK_ENABLED"
@@ -84,6 +108,14 @@ _ACTION_CONTEXT_TRIMMED_APPLICATION_NAME_LIMIT = (
 )
 _ACTION_CONTEXT_TRIMMED_APPLICATION_NAME_DEFAULT_LIMIT = 250
 _ACTION_ACK = "진행하겠습니다!"
+_RECENT_USER_MESSAGE_TTL_SECONDS = 300.0
+_LIVE_TTS_WAIT_SECONDS = 120.0
+_LIVE_TTS_MIN_SEGMENT_CHARS = 36
+_LIVE_TTS_MAX_SEGMENT_CHARS = 90
+_LIVE_TTS_SOFT_SEGMENT_CHARS = 54
+_LIVE_TTS_SENTENCE_RE = re.compile(r"(.+?[.!?。！？…]|.+?[.!?]['\")\]]+)(\s+|$)", re.DOTALL)
+_LIVE_TTS_SOFT_BREAK_RE = re.compile(r"^(.+?[,，、;；:：]|.+?(?:요|다|죠|네|니다|습니다)[,，]?)(\s+|$)", re.DOTALL)
+_LIVE_TTS_SESSIONS: dict[str, "_LiveTtsSession"] = {}
 _LOCAL_APP_ALIAS_PROFILE: dict[str, dict[str, tuple[str, ...]]] = {
     "com.apple.stocks": {
         "aliases": ("주식", "주식앱", "증권", "Stocks", "stocks"),
@@ -111,6 +143,14 @@ _ACTION_OBJECT_TERMS = (
     "app",
     "터미널",
     "terminal",
+    "cmd",
+    "콘솔",
+    "console",
+    "명령 프롬프트",
+    "할일",
+    "할 일",
+    "todo",
+    "to-do",
     "파일",
     "file",
     "폴더",
@@ -183,6 +223,12 @@ class ChatRequest(BaseModel):
     task_type: Literal["general", "analysis", "execution"] = "general"
     confirm: bool = False
     thinking_mode: Literal["auto", "realtime", "deep"] = "auto"
+    tts_enabled: bool = False
+    tts_voice: str = Field(default="default", max_length=80)
+    tts_model: str | None = Field(default=None, max_length=4096)
+    tts_sample_rate: int = Field(default=24000, ge=8000, le=48000)
+    tts_channels: Literal[1, 2] = 1
+    tts_sample_width: Literal[2] = 2
 
 
 class ChatResponse(BaseModel):
@@ -192,6 +238,72 @@ class ChatResponse(BaseModel):
     provider_name: str
     model_name: str
     content: str
+
+
+class TextToSpeechRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=8000)
+    provider: Literal["openai", "local"] = "openai"
+    model: Literal["gpt-4o-mini-tts", "tts-1", "tts-1-hd"] = "gpt-4o-mini-tts"
+    voice: Literal[
+        "alloy",
+        "ash",
+        "ballad",
+        "coral",
+        "echo",
+        "fable",
+        "nova",
+        "onyx",
+        "sage",
+        "shimmer",
+        "verse",
+        "marin",
+        "cedar",
+    ] = "marin"
+    response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = "mp3"
+    instructions: str | None = Field(default=None, max_length=1200)
+    speed: float | None = Field(default=None, ge=0.25, le=4.0)
+
+    @model_validator(mode="after")
+    def validate_model_voice(self) -> "TextToSpeechRequest":
+        if self.model in {"tts-1", "tts-1-hd"} and self.voice not in LEGACY_TTS_VOICES:
+            raise ValueError(f"{self.model} does not support voice {self.voice!r}")
+        return self
+
+
+class TextToSpeechChunk(BaseModel):
+    id: str | None = Field(default=None, max_length=80)
+    text: str = Field(min_length=1, max_length=4000)
+
+
+class TextToSpeechPCMRequest(BaseModel):
+    chunks: list[TextToSpeechChunk] = Field(min_length=1, max_length=64)
+    voice: str = Field(default="default", max_length=80)
+    model: str | None = Field(default=None, max_length=4096)
+    sample_rate: int = Field(default=24000, ge=8000, le=48000)
+    channels: Literal[1, 2] = 1
+    sample_width: Literal[2] = 2
+    format: Literal["pcm_s16le"] = "pcm_s16le"
+
+    @field_validator("voice", mode="before")
+    @classmethod
+    def normalize_voice(cls, value: Any) -> str:
+        voice = "" if value is None else str(value).strip()
+        if voice.lower() in PCM_DEFAULT_VOICE_ALIASES:
+            return "default"
+        return voice
+
+    @field_validator("model", mode="before")
+    @classmethod
+    def normalize_model(cls, value: Any) -> str | None:
+        model = "" if value is None else str(value).strip()
+        if model.lower() in PCM_DEFAULT_MODEL_ALIASES:
+            return None
+        return model
+
+
+class ConversationCancelRequest(BaseModel):
+    request_id: str | None = None
+    reason: str = "barge_in"
 
 
 class ModelConfigRequest(BaseModel):
@@ -290,6 +402,212 @@ def _sse_event(event: str, payload: dict[str, object]) -> bytes:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode(
         "utf-8"
     )
+
+
+class _LiveTtsSession:
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        request_id: str,
+        user_id: str,
+        config: dict[str, object],
+    ) -> None:
+        self.session_id = session_id
+        self.request_id = request_id
+        self.user_id = user_id
+        self.config = config
+        self.text_queue: queue.Queue[str | None] = queue.Queue()
+        self.closed = False
+
+
+def _live_tts_config(req: object) -> dict[str, object]:
+    body: dict[str, object] = {
+        "voice": getattr(req, "tts_voice", "default") or "default",
+        "sample_rate": getattr(req, "tts_sample_rate", 24000),
+        "channels": getattr(req, "tts_channels", 1),
+        "sample_width": getattr(req, "tts_sample_width", 2),
+        "format": "pcm_s16le",
+    }
+    model = getattr(req, "tts_model", None)
+    if model:
+        body["model"] = model
+    return body
+
+
+def _create_live_tts_session(
+    *,
+    req: object,
+    request_id: str,
+    user_id: str,
+) -> _LiveTtsSession:
+    session_id = f"tts_{uuid4().hex}"
+    session = _LiveTtsSession(
+        session_id=session_id,
+        request_id=request_id,
+        user_id=user_id,
+        config=_live_tts_config(req),
+    )
+    _LIVE_TTS_SESSIONS[session_id] = session
+    return session
+
+
+def _finish_live_tts_session(session: _LiveTtsSession) -> None:
+    if session.closed:
+        return
+    session.closed = True
+    session.text_queue.put(None)
+
+
+def _split_live_tts_segments(buffer: str) -> tuple[list[str], str]:
+    segments: list[str] = []
+    remaining = buffer
+    pending = ""
+    while remaining:
+        match = _LIVE_TTS_SENTENCE_RE.match(remaining)
+        if match:
+            segment = match.group(1).strip()
+            if segment:
+                pending = f"{pending} {segment}".strip()
+                if len(pending) >= _LIVE_TTS_MIN_SEGMENT_CHARS:
+                    segments.append(pending)
+                    pending = ""
+            remaining = remaining[match.end() :].lstrip()
+            continue
+        soft_match = _LIVE_TTS_SOFT_BREAK_RE.match(remaining)
+        if soft_match:
+            candidate = f"{pending} {soft_match.group(1).strip()}".strip()
+            if len(candidate) >= _LIVE_TTS_SOFT_SEGMENT_CHARS:
+                segments.append(candidate)
+                pending = ""
+                remaining = remaining[soft_match.end() :].lstrip()
+                continue
+        candidate = f"{pending} {remaining}".strip()
+        if len(candidate) >= _LIVE_TTS_MAX_SEGMENT_CHARS:
+            split_at = max(
+                remaining.rfind(" ", 0, _LIVE_TTS_MAX_SEGMENT_CHARS),
+                remaining.rfind(",", 0, _LIVE_TTS_MAX_SEGMENT_CHARS),
+                remaining.rfind("，", 0, _LIVE_TTS_MAX_SEGMENT_CHARS),
+                remaining.rfind("、", 0, _LIVE_TTS_MAX_SEGMENT_CHARS),
+            )
+            if split_at < _LIVE_TTS_MIN_SEGMENT_CHARS:
+                split_at = _LIVE_TTS_MAX_SEGMENT_CHARS
+            segment = f"{pending} {remaining[:split_at]}".strip()
+            if segment:
+                segments.append(segment)
+            pending = ""
+            remaining = remaining[split_at:].lstrip()
+            continue
+        break
+    return segments, f"{pending} {remaining}".strip()
+
+
+def _stream_with_live_tts(
+    stream: Generator[bytes, None, None],
+    *,
+    req: object,
+    request_id: str,
+    user_id: str,
+) -> Generator[bytes, None, None]:
+    if not bool(getattr(req, "tts_enabled", False)):
+        yield from stream
+        return
+
+    session = _create_live_tts_session(req=req, request_id=request_id, user_id=user_id)
+    saw_delta = False
+    yield _sse_event(
+        "tts_session",
+        {
+            "session_id": session.session_id,
+            "request_id": request_id,
+            "stream_url": f"/audio/speech/live/{session.session_id}",
+            "format": "pcm_s16le",
+            "sample_rate": session.config["sample_rate"],
+            "channels": session.config["channels"],
+            "sample_width": session.config["sample_width"],
+        },
+    )
+
+    try:
+        for chunk in stream:
+            for event_name, payload in _sse_payloads_from_chunk(chunk):
+                if event_name == "assistant_delta":
+                    content = payload.get("content")
+                    if (
+                        isinstance(content, str)
+                        and content.strip()
+                        and content.strip() != _ACTION_ACK.strip()
+                    ):
+                        saw_delta = True
+                        session.text_queue.put(content)
+                elif event_name in {"assistant_done", "conversation.done", "done"}:
+                    content = payload.get("content") or payload.get("text")
+                    if (
+                        isinstance(content, str)
+                        and content.strip()
+                        and not saw_delta
+                        and content.strip() != _ACTION_ACK.strip()
+                    ):
+                        session.text_queue.put(content)
+                    _finish_live_tts_session(session)
+            yield chunk
+    finally:
+        _finish_live_tts_session(session)
+
+
+def _stream_live_tts_segment(
+    *,
+    session: _LiveTtsSession,
+    request: Request,
+    chunk_id: str,
+    text: str,
+) -> Generator[bytes, None, None]:
+    body = dict(session.config)
+    body["chunks"] = [{"id": chunk_id, "text": text}]
+    result = request.app.state.core_client.synthesize_speech_pcm_stream(
+        user_id=session.user_id,
+        body=body,
+        request_id=session.request_id,
+    )
+    yield from result.body
+
+
+def _stream_live_tts_pcm(
+    *,
+    session: _LiveTtsSession,
+    request: Request,
+) -> Generator[bytes, None, None]:
+    buffer = ""
+    index = 0
+    try:
+        while True:
+            try:
+                text = session.text_queue.get(timeout=_LIVE_TTS_WAIT_SECONDS)
+            except queue.Empty:
+                break
+            if text is None:
+                break
+            buffer += text
+            segments, buffer = _split_live_tts_segments(buffer)
+            for segment in segments:
+                index += 1
+                yield from _stream_live_tts_segment(
+                    session=session,
+                    request=request,
+                    chunk_id=f"{session.session_id}:{index}",
+                    text=segment,
+                )
+
+        final_text = buffer.strip()
+        if final_text:
+            yield from _stream_live_tts_segment(
+                session=session,
+                request=request,
+                chunk_id=f"{session.session_id}:final",
+                text=final_text,
+            )
+    finally:
+        _LIVE_TTS_SESSIONS.pop(session.session_id, None)
 
 
 def _log_classification(message: str, mode: ConversationMode, confidence: float) -> None:
@@ -571,6 +889,45 @@ def _action_ack_suppressed_done() -> bytes:
     )
 
 
+def _stream_without_leading_action_ack(
+    stream: Generator[bytes, None, None],
+) -> Generator[bytes, None, None]:
+    buffered = ""
+    suppressing = True
+    for chunk in stream:
+        payloads = _sse_payloads_from_chunk(chunk)
+        if (
+            suppressing
+            and len(payloads) == 1
+            and payloads[0][0] == "assistant_delta"
+        ):
+            _event_name, payload = payloads[0]
+            content = payload.get("content")
+            if not isinstance(content, str):
+                suppressing = False
+                yield chunk
+                continue
+            candidate = buffered + content
+            if _ACTION_ACK.startswith(candidate):
+                buffered = candidate
+                continue
+            if candidate.startswith(_ACTION_ACK):
+                suppressing = False
+                remainder = candidate[len(_ACTION_ACK) :].lstrip()
+                if remainder:
+                    payload["content"] = remainder
+                    yield _sse_event("assistant_delta", payload)
+                continue
+            suppressing = False
+            if buffered:
+                payload["content"] = candidate
+                yield _sse_event("assistant_delta", payload)
+            else:
+                yield chunk
+            continue
+        yield chunk
+
+
 def _looks_like_direct_client_action_request(
     message: str,
     *,
@@ -579,20 +936,26 @@ def _looks_like_direct_client_action_request(
     text = message.strip()
     if not text:
         return False
-    if _weather_app_target_from_message(text, context=context) is not None:
-        return True
-    if _application_open_target_from_message(text, context=context) is not None:
+    if _looks_like_meta_design_or_analysis_request(text):
+        return False
+    if _template_app_open_decision_from_text(text, context=context) is not None:
         return True
     if _open_url_from_message(text) is not None:
         return True
+    if _browser_search_query_from_message(text, context=context) is not None:
+        return True
     if _terminal_command_from_message(text, context=context) is not None:
+        return True
+    if _todo_create_action_from_message(text) is not None:
+        return True
+    if _todo_delete_action_from_message(text) is not None:
+        return True
+    if _todo_list_action_from_message(text) is not None:
         return True
     folded = text.casefold()
     has_object = any(term in folded for term in _ACTION_OBJECT_TERMS)
     has_verb = any(term in folded for term in _ACTION_VERB_TERMS)
     if has_object and has_verb:
-        return True
-    if _browser_search_query_from_message(text) is not None:
         return True
     if _browser_result_index_from_message(text) is not None and _browser_context_active(
         context
@@ -609,174 +972,154 @@ def _normalized_action_match_key(value: str) -> str:
     return re.sub(r"\s+", "", value.strip().casefold())
 
 
-def _application_candidates(app: object) -> tuple[str | None, list[str]]:
-    if isinstance(app, str):
-        name = app.strip()
-        return (name or None), [name] if name else []
-    if not isinstance(app, dict):
-        return None, []
-    name_value = app.get("name") or app.get("display_name")
-    name = name_value.strip() if isinstance(name_value, str) else None
-    candidates: list[str] = []
-    for key in (
-        "name",
-        "display_name",
-        "bundle_id",
-        "aliases",
-        "capabilities",
-        "categories",
-        "keywords",
-    ):
-        value = app.get(key)
-        if isinstance(value, str) and value.strip():
-            candidates.append(value.strip())
-        elif isinstance(value, list):
-            candidates.extend(
-                item.strip()
-                for item in value
-                if isinstance(item, str) and item.strip()
-            )
-    return name, candidates
-
-
-def _application_open_target_from_message(
-    message: str,
+def _template_app_open_decision_from_text(
+    text: str,
     *,
     context: dict[str, object] | None,
-) -> str | None:
-    folded = message.casefold()
-    if not _application_open_requested(folded):
+) -> ActionIntentDecision | None:
+    if not _context_supports_any_action(context, ("app.open", "app_control")):
         return None
-    message_key = _normalized_action_match_key(message)
-    applications = context.get("available_applications") if context else None
-    app_items = applications if isinstance(applications, list) else []
-    for app in app_items:
-        name, candidates = _application_candidates(app)
-        if not name:
-            continue
-        for candidate in candidates:
-            candidate_key = _normalized_action_match_key(candidate)
-            if len(candidate_key) >= 3 and candidate_key in message_key:
-                return name
 
-    # Runtime profiles may still be warming up; keep a tiny alias table for common apps.
-    fallback_aliases = {
-        "sublimetext": "Sublime Text",
-        "sublime": "Sublime Text",
-        "서브라임": "Sublime Text",
-        "주식": "Stocks",
-        "주식앱": "Stocks",
-        "증권": "Stocks",
-    }
-    for alias, target in fallback_aliases.items():
-        if alias in message_key:
-            return target
-    return None
+    materialized = materialize_explicit_app_open_for_text(
+        text,
+        confidence=0.9,
+        context=context,
+        reason="app_open template matched runtime app metadata",
+    )
+    decision = _action_decision_from_template_plan(materialized, context=context)
+    if decision is not None:
+        return decision
+
+    materialized = materialize_fresh_context_app_open_for_text(
+        text,
+        confidence=0.9,
+        context=context,
+        reason="fresh context app_open template matched runtime app metadata",
+    )
+    return _action_decision_from_template_plan(materialized, context=context)
 
 
-def _application_open_requested(folded_message: str) -> bool:
-    if any(
-        term in folded_message
-        for term in ("열어", "켜", "실행", "open", "launch", "run")
-    ):
-        return True
-    has_local_app_reference = any(
-        term in folded_message
-        for term in ("내 노트북", "내 맥", "내 mac", "로컬", "local")
-    ) and any(term in folded_message for term in ("앱", "어플", "app", "application"))
-    return has_local_app_reference
-
-
-def _weather_app_target_from_message(
-    message: str,
+def _template_app_open_type_decision_from_text(
+    text: str,
     *,
     context: dict[str, object] | None,
-) -> str | None:
-    if not _weather_requested(message):
+) -> ActionIntentDecision | None:
+    if not _context_supports_any_action(context, ("app.open", "app_control")):
         return None
-    explicit_app_open = _explicit_weather_app_open_requested(message)
-    if (
-        not explicit_app_open
-        and _active_app_matches(context, ("weather", "날씨", "com.apple.weather"))
-    ):
+    if not _context_supports_any_action(context, ("keyboard.type", "keyboard_type")):
+        return None
+    typed_text = _app_type_text_from_message(text)
+    if typed_text is None:
         return None
 
-    applications = context.get("available_applications") if context else None
-    app_items = applications if isinstance(applications, list) else []
-    for app in app_items:
-        name, candidates = _application_candidates(app)
-        if not name:
-            continue
-        candidate_keys = {
-            _normalized_action_match_key(candidate)
-            for candidate in candidates
-            if candidate
-        }
-        if candidate_keys.intersection(
-            {"weather", "날씨", "forecast", "예보", "com.apple.weather"}
-        ):
-            return name
-
-    if _context_supports_any_action(context, ("app.open", "app_control")):
-        return "Weather"
-    return None
-
-
-def _weather_requested(message: str) -> bool:
-    folded = message.casefold()
-    return any(term in folded for term in ("날씨", "weather", "forecast", "예보"))
-
-
-def _explicit_weather_app_open_requested(message: str) -> bool:
-    folded = message.casefold()
-    message_key = _normalized_action_match_key(message)
-    mentions_weather_app = (
-        "날씨앱" in message_key
-        or "날씨어플" in message_key
-        or "weatherapp" in message_key
-        or "weatherapplication" in message_key
-        or "com.apple.weather" in folded
+    materialized = materialize_fresh_context_app_open_for_text(
+        text,
+        confidence=0.9,
+        context=context,
+        reason="app_open_type template matched runtime app metadata",
     )
-    if not mentions_weather_app:
-        return False
-    return any(
-        term in folded
-        for term in (
-            "켜",
-            "열어",
-            "실행",
-            "재실행",
-            "다시",
-            "open",
-            "launch",
-            "reopen",
-            "focus",
-            "start",
-        )
-    )
+    plan = getattr(materialized, "plan", None)
+    if plan is None or not getattr(plan, "actions", None):
+        return None
+    app_action = plan.actions[0]
+    app_name = getattr(app_action, "target", None)
+    if not isinstance(app_name, str) or not app_name.strip():
+        return None
 
-
-def _active_app_matches(
-    context: dict[str, object] | None,
-    candidates: tuple[str, ...],
-) -> bool:
-    if not context:
-        return False
-    candidate_keys = {_normalized_action_match_key(candidate) for candidate in candidates}
-    containers = [
-        context,
-        context.get("working_context"),
-        context.get("latest_action_result"),
-        context.get("latest_observation"),
+    actions = [
+        ClientAction(
+            type="app_control",
+            command="open",
+            target=app_name.strip(),
+            args={},
+            description=f"Open {app_name.strip()}",
+            requires_confirm=False,
+        ),
+        ClientAction(
+            type="keyboard_type",
+            command=None,
+            target=None,
+            payload=typed_text,
+            args={"enter": False},
+            description="Type text",
+            requires_confirm=False,
+        ),
     ]
-    for container in containers:
-        if not isinstance(container, dict):
-            continue
-        for key in ("active_app", "launched_app", "app", "bundle_id"):
-            value = container.get(key)
-            if isinstance(value, str) and _normalized_action_match_key(value) in candidate_keys:
-                return True
-    return False
+    return ActionIntentDecision(
+        should_act=True,
+        execution_mode="direct_sequence",
+        intent="app.open+keyboard.type",
+        confidence=0.9,
+        reason="local action template: app open and type",
+        actions=actions,
+    )
+
+
+def _app_type_text_from_message(message: str) -> str | None:
+    if not any(term in message for term in ("작성", "입력", "타이핑")) and not re.search(
+        r"\b(?:type|write|input)\b",
+        message,
+        flags=re.IGNORECASE,
+    ):
+        return None
+    match = re.search(
+        r"(?:에|에서|로|으로|켜서|열어서|열고|켜고)\s*(?P<text>.+?)\s*"
+        r"(?:작성|입력|타이핑|type|write|input)"
+        r"(?:\s*(?:해|해줘|해줄래|해\s*줄래|해주세요|줘|줄래|부탁해))?"
+        r"\s*\??\s*$",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    text = _normalize_app_type_text(match.group("text"))
+    if not text or len(text) > 500:
+        return None
+    if any(term in text for term in ("소개", "글", "문장", "내용", "대답", "답변")):
+        return None
+    return text
+
+
+def _normalize_app_type_text(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text).strip(" \t\r\n.。!?")
+    normalized = re.sub(
+        r"\s*(?:라고|이라고|라구|이라구)\s*$",
+        "",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+    return normalized.strip(" \t\r\n\"'“”‘’`.,，.。!?")
+
+
+def _action_decision_from_template_plan(
+    materialized,
+    *,
+    context: dict[str, object] | None,
+) -> ActionIntentDecision | None:
+    plan = getattr(materialized, "plan", None)
+    if plan is None:
+        return None
+    adapted = V2ToV1ActionAdapter().adapt_plan(plan, context=context)
+    if not adapted.valid or not adapted.actions:
+        return None
+    execution_mode = getattr(plan, "mode", "direct")
+    if execution_mode not in DIRECT_EXECUTION_MODES:
+        execution_mode = "direct_sequence" if len(adapted.actions) > 1 else "direct"
+    plan_actions = getattr(plan, "actions", []) or []
+    intent = getattr(plan_actions[0], "name", "action") if plan_actions else "action"
+    return ActionIntentDecision(
+        should_act=True,
+        execution_mode=execution_mode,
+        intent=intent,
+        confidence=float(getattr(plan, "confidence", 0.9) or 0.9),
+        reason=str(
+            getattr(plan, "reason", "action template matched")
+            or "action template matched"
+        ),
+        actions=adapted.actions,
+        plan=plan,
+        validation_errors=[],
+    )
 
 
 def _open_url_from_message(message: str) -> str | None:
@@ -841,29 +1184,203 @@ def _terminal_command_from_message(
     *,
     context: dict[str, object] | None,
 ) -> str | None:
+    if _looks_like_meta_design_or_analysis_request(message):
+        return None
+    if _browser_search_query_from_message(message, context=context) is not None:
+        return None
     folded = message.casefold()
     terminalish = any(
         term in folded
-        for term in ("터미널", "terminal", "쉘", "shell", "명령어", "command")
+        for term in (
+            "터미널",
+            "terminal",
+            "cmd",
+            "command prompt",
+            "콘솔",
+            "console",
+            "쉘",
+            "shell",
+            "명령어",
+            "command",
+        )
     )
     runish = any(
         term in folded
-        for term in ("실행", "쳐", "입력", "해줘", "run", "execute", "보여", "확인")
+        for term in (
+            "실행",
+            "수행",
+            "쳐",
+            "입력",
+            "해줘",
+            "run",
+            "execute",
+            "보여",
+            "확인",
+        )
     )
     if not (terminalish and runish):
         return None
 
     explicit = _quoted_terminal_command(message)
-    if explicit and _terminal_command_allowed(explicit, context):
+    if explicit:
         return explicit
 
     command = _terminal_command_after_marker(message)
-    if command and _terminal_command_allowed(command, context):
+    if command:
         return command
 
     natural = _known_terminal_command_for_message(folded, context=context)
     if natural and _terminal_command_allowed(natural, context):
         return natural
+    return None
+
+
+def _looks_like_meta_design_or_analysis_request(message: str) -> bool:
+    folded = message.casefold()
+    design_terms = (
+        "분석",
+        "설계",
+        "계획",
+        "플랜",
+        "리팩토링",
+        "리팩터링",
+        "구조",
+        "아키텍처",
+        "우선순위",
+        "충돌",
+        "비교",
+        "제안",
+        "고려",
+        "analysis",
+        "analyze",
+        "design",
+        "plan",
+        "refactor",
+        "architecture",
+        "priority",
+        "conflict",
+        "compare",
+    )
+    action_domain_terms = (
+        "액션",
+        "라우팅",
+        "intent",
+        "인텐트",
+        "앱 실행",
+        "브라우저 검색",
+        "터미널 실행",
+        "action",
+        "routing",
+        "browser search",
+        "terminal",
+    )
+    return any(term in folded for term in design_terms) and any(
+        term in folded for term in action_domain_terms
+    )
+
+
+def _looks_like_cross_surface_architecture_request(message: str) -> bool:
+    folded = message.casefold()
+    design_terms = (
+        "설계",
+        "구조",
+        "아키텍처",
+        "계획",
+        "플랜",
+        "제안",
+        "고려",
+        "나눠서",
+        "연동",
+        "design",
+        "architecture",
+        "plan",
+        "proposal",
+        "integration",
+    )
+    surface_terms = (
+        "백엔드",
+        "프론트",
+        "프론트엔드",
+        "db",
+        "데이터베이스",
+        "api",
+        "todo",
+        "할일",
+        "캘린더",
+        "calendar",
+        "연동",
+    )
+    if not any(term in folded for term in design_terms):
+        return False
+    return sum(1 for term in surface_terms if term in folded) >= 2
+
+
+def _looks_like_code_output_request(message: str) -> bool:
+    folded = message.casefold()
+    code_terms = (
+        "코드",
+        "소스",
+        "함수",
+        "클래스",
+        "스크립트",
+        "프로그램",
+        "구현",
+        "code",
+        "source",
+        "function",
+        "class",
+        "script",
+        "program",
+        "implementation",
+    )
+    output_terms = (
+        "작성",
+        "짜",
+        "만들",
+        "제공",
+        "보여",
+        "예시",
+        "구현",
+        "생성",
+        "write",
+        "make",
+        "create",
+        "provide",
+        "show",
+        "example",
+        "generate",
+        "implement",
+    )
+    return any(term in folded for term in code_terms) and any(
+        term in folded for term in output_terms
+    )
+
+
+def _obvious_non_realtime_decision(message: str) -> RoutingDecision | None:
+    text = message.strip()
+    if not text:
+        return None
+    if _looks_like_code_output_request(text):
+        return RoutingDecision(
+            mode=ConversationMode.DEEP,
+            triggered=True,
+            confidence=0.9,
+            reasons=["code generation request"],
+        )
+    if _looks_like_meta_design_or_analysis_request(text):
+        return RoutingDecision(
+            mode=ConversationMode.DEEP,
+            triggered=True,
+            confidence=0.95,
+            reasons=["analysis-oriented language", "action-routing design request"],
+        )
+    if _looks_like_cross_surface_architecture_request(text):
+        return RoutingDecision(
+            mode=ConversationMode.DEEP,
+            triggered=True,
+            confidence=0.9,
+            reasons=["analysis-oriented language", "architecture design request"],
+        )
     return None
 
 
@@ -878,10 +1395,13 @@ def _quoted_terminal_command(message: str) -> str | None:
 
 
 def _terminal_command_after_marker(message: str) -> str | None:
-    marker = r"(?:터미널(?:에서|로)?|terminal|쉘(?:에서|로)?|shell|명령어|command)"
+    marker = (
+        r"(?:터미널(?:에서|로)?|terminal|cmd|command prompt|"
+        r"콘솔(?:에서|로)?|console|쉘(?:에서|로)?|shell|명령어|command)"
+    )
     command_tail = (
         r"\s*(?:에서|로)?\s*(?P<command>.+?)\s*"
-        r"(?:실행(?:해줘|해|시켜줘)?|쳐줘|입력(?:해줘)?|해줘|run|execute)?\s*$"
+        r"(?:실행(?:해줘|해|시켜줘)?|수행(?:해줘|해)?|쳐줘|입력(?:해줘)?|해줘|run|execute)?\s*$"
     )
     match = re.search(
         marker + command_tail,
@@ -892,7 +1412,7 @@ def _terminal_command_after_marker(message: str) -> str | None:
         return None
     command = match.group("command").strip(" \t\r\n.。!?")
     command = re.sub(
-        r"\s*(?:실행(?:해줘|해|시켜줘)?|쳐줘|입력(?:해줘)?|해줘|run|execute)\s*$",
+        r"\s*(?:실행(?:해줘|해|시켜줘)?|수행(?:해줘|해)?|쳐줘|입력(?:해줘)?|해줘|run|execute)\s*$",
         "",
         command,
         flags=re.IGNORECASE,
@@ -934,13 +1454,11 @@ def _known_terminal_command_for_message(
 
 
 def _terminal_enabled(context: dict[str, object] | None) -> bool:
-    if not _context_supports_any_action(context, ("terminal.run", "terminal")):
-        return False
     if not context:
         return True
     terminal = context.get("terminal")
     if isinstance(terminal, dict):
-        return bool(terminal.get("enabled", False))
+        return terminal.get("enabled", True) is not False
     return True
 
 
@@ -989,6 +1507,406 @@ def _terminal_cwd(command: str, terminal_context: dict[str, object]) -> str | No
     return None
 
 
+def _todo_create_action_from_message(message: str) -> ClientAction | None:
+    if not _todo_create_requested(message):
+        return None
+    title, due_at = _todo_title_and_due_at(message)
+    if not title:
+        return None
+    args: dict[str, object] = {
+        "title": title,
+        "timezone": "Asia/Seoul",
+        "metadata": {"source": "conversation_action_template"},
+    }
+    if due_at is not None:
+        args["due_at"] = due_at.isoformat()
+    return ClientAction(
+        type="todo",
+        command="create",
+        target=None,
+        payload=title,
+        args=args,
+        description=f"Create todo: {title}",
+        requires_confirm=False,
+    )
+
+
+def _todo_list_action_from_message(message: str) -> ClientAction | None:
+    free_time_requested = _free_time_check_requested(message)
+    if not free_time_requested and not _todo_list_requested(message):
+        return None
+    folded = message.casefold()
+    status = "open"
+    if any(term in folded for term in ("완료", "끝낸", "completed", "done")):
+        status = "completed"
+    args: dict[str, object] = {
+        "status": status,
+        "include_deleted": False,
+        "limit": 50,
+        "metadata": {"source": "conversation_action_template"},
+    }
+    if "오늘" in folded or "today" in folded or free_time_requested:
+        args["date_scope"] = "today"
+    if free_time_requested:
+        args["summary_mode"] = "free_time"
+    return ClientAction(
+        type="todo",
+        command="list",
+        target=None,
+        payload=None,
+        args=args,
+        description="List todos",
+        requires_confirm=False,
+    )
+
+
+def _todo_delete_action_from_message(message: str) -> ClientAction | None:
+    if not _todo_delete_requested(message):
+        return None
+    query = _todo_delete_query(message)
+    args: dict[str, object] = {
+        "status": "open",
+        "include_deleted": False,
+        "limit": 100,
+        "metadata": {"source": "conversation_action_template"},
+    }
+    if query:
+        args["query"] = query
+    folded = message.casefold()
+    if "오늘" in folded or "today" in folded:
+        args["date_scope"] = "today"
+    due_hours = _todo_due_hour_candidates(message)
+    if due_hours:
+        args["due_hours"] = due_hours
+    return ClientAction(
+        type="todo",
+        command="delete",
+        target=None,
+        payload=None,
+        args=args,
+        description=f"Delete todo: {query}" if query else "Delete todo",
+        requires_confirm=False,
+    )
+
+
+def _todo_create_requested(message: str) -> bool:
+    folded = message.casefold()
+    message_key = _normalized_action_match_key(message)
+    has_todo_object = any(
+        term in message_key
+        for term in (
+            "할일",
+            "todo",
+            "to-do",
+            "해야할일",
+            "할것",
+            "회의",
+            "미팅",
+            "약속",
+            "일정",
+        )
+    ) or any(term in folded for term in ("task list", "to do list"))
+    has_create_verb = any(
+        term in folded
+        for term in (
+            "추가",
+            "등록",
+            "넣어",
+            "만들어",
+            "add",
+            "create",
+            "put",
+        )
+    )
+    return has_todo_object and has_create_verb
+
+
+def _todo_list_requested(message: str) -> bool:
+    folded = message.casefold()
+    message_key = _normalized_action_match_key(message)
+    has_todo_object = any(
+        term in message_key
+        for term in ("할일", "todo", "to-do", "해야할일", "할것")
+    ) or any(term in folded for term in ("task list", "to do list"))
+    has_list_verb = any(
+        term in folded
+        for term in (
+            "남은",
+            "뭐남",
+            "뭐 남",
+            "목록",
+            "리스트",
+            "보여",
+            "알려",
+            "확인",
+            "조회",
+            "list",
+            "show",
+            "remaining",
+            "left",
+        )
+    )
+    return has_todo_object and has_list_verb
+
+
+def _free_time_check_requested(message: str) -> bool:
+    folded = message.casefold()
+    message_key = _normalized_action_match_key(message)
+    has_free_time = any(
+        term in message_key
+        for term in (
+            "빈시간",
+            "비는시간",
+            "남는시간",
+            "가능한시간",
+            "시간비어",
+            "시간비는",
+        )
+    ) or any(term in folded for term in ("free time", "available time", "availability"))
+    has_check_verb = any(
+        term in folded
+        for term in (
+            "체크",
+            "확인",
+            "알려",
+            "봐",
+            "찾아",
+            "check",
+            "show",
+            "find",
+        )
+    )
+    return has_free_time and has_check_verb
+
+
+def _todo_delete_requested(message: str) -> bool:
+    folded = message.casefold()
+    message_key = _normalized_action_match_key(message)
+    has_delete_verb = any(
+        term in folded
+        for term in (
+            "삭제",
+            "지워",
+            "제거",
+            "없애",
+            "빼",
+            "빼줘",
+            "빼기",
+            "delete",
+            "remove",
+        )
+    )
+    if not has_delete_verb:
+        return False
+    has_todo_object = any(
+        term in message_key
+        for term in (
+            "할일",
+            "todo",
+            "to-do",
+            "해야할일",
+            "할것",
+            "회의",
+            "미팅",
+            "약속",
+            "일정",
+        )
+    )
+    return has_todo_object or _extract_todo_due_at(message)[1] is not None
+
+
+def _todo_delete_query(message: str) -> str | None:
+    query = re.sub(
+        r"(?:삭제|지워|제거|없애|빼|빼줘|빼기|delete|remove)"
+        r"(?:\s*(?:해|해줘|해줄래|해\s*줄래|해주세요|줘|줄래|부탁해))?"
+        r"\s*\??\s*$",
+        "",
+        message,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"\b(?:today)\b", " ", query, flags=re.IGNORECASE)
+    query = re.sub(r"(?:오늘|내일|모레)", " ", query)
+    query = re.sub(
+        r"(?:오전|오후)?\s*\d{1,2}\s*시\s*(?:\d{1,2}\s*분?)?",
+        " ",
+        query,
+    )
+    query = re.sub(
+        r"(?:할\s*일|해야\s*할\s*일|할것|todo|to-do)(?:\s*(?:목록|리스트))?",
+        " ",
+        query,
+        flags=re.IGNORECASE,
+    )
+    query = re.sub(r"\b(?:에서|에|으로|로)\b", " ", query)
+    query = re.sub(r"\s+", " ", query).strip(" \t\r\n.。!?")
+    if len(query) > 200:
+        query = query[:200].rstrip()
+    return query or None
+
+
+def _todo_due_hour_candidates(message: str) -> list[int]:
+    match = re.search(
+        r"(?P<ampm>오전|오후|am|pm)?\s*(?P<hour>\d{1,2})\s*시",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return []
+    hour = int(match.group("hour"))
+    if hour > 23:
+        return []
+    ampm = (match.group("ampm") or "").casefold()
+    if ampm in {"오후", "pm"} and hour < 12:
+        return [hour + 12]
+    if ampm in {"오전", "am"}:
+        return [0 if hour == 12 else hour]
+    if 1 <= hour <= 11:
+        return [hour, hour + 12]
+    return [hour]
+
+
+def _todo_title_and_due_at(message: str) -> tuple[str | None, datetime | None]:
+    due_match, due_at = _extract_todo_due_at(message)
+    title = message
+    if due_match is not None:
+        title = f"{message[: due_match.start()]} {message[due_match.end() :]}"
+    title = _strip_todo_time_phrase(title)
+    title = re.sub(
+        r"^\s*(?:할\s*일|해야\s*할\s*일|할것|todo|to-do)"
+        r"(?:\s*(?:목록|리스트))?"
+        r"(?:에|으로)?\s*",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"\s*(?:까지|전까지|by)?\s*"
+        r"(?:할\s*일|해야\s*할\s*일|할것|todo|to-do)"
+        r"(?:\s*(?:목록|리스트))?"
+        r"(?:에|으로)?\s*"
+        r"(?:추가|등록|넣어|만들어|add|create)"
+        r"(?:\s*(?:해|해줘|해줄래|해\s*줄래|해주세요|줘|줄래|부탁해))?"
+        r"\s*\??\s*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"\s*(?:추가|등록|넣어|만들어|add|create)"
+        r"(?:\s*(?:해|해줘|해줄래|해\s*줄래|해주세요|줘|줄래|부탁해))?"
+        r"\s*\??\s*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(
+        r"\s*(?:까지|전까지)\s*$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+    title = re.sub(r"\s+", " ", title).strip(" \t\r\n.。!?")
+    if len(title) > 200:
+        title = title[:200].rstrip()
+    return (title or None), due_at
+
+
+def _strip_todo_time_phrase(message: str) -> str:
+    return re.sub(
+        r"(?:오전|오후|am|pm)?\s*\d{1,2}\s*(?:시|:)"
+        r"\s*(?:\d{1,2}\s*(?:분)?)?\s*(?:에)?",
+        " ",
+        message,
+        flags=re.IGNORECASE,
+    )
+
+
+def _extract_todo_due_at(message: str) -> tuple[re.Match[str] | None, datetime | None]:
+    date_patterns = (
+        r"(?P<month>\d{1,2})\s*[/-]\s*(?P<day>\d{1,2})"
+        r"(?:\s+(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?)?",
+        r"(?P<month>\d{1,2})\s*월\s*(?P<day>\d{1,2})\s*일"
+        r"(?:\s*(?P<hour>\d{1,2})\s*(?:시|:)"
+        r"\s*(?P<minute>\d{1,2})?\s*(?:분)?)?",
+    )
+    for pattern in date_patterns:
+        match = re.search(pattern, message)
+        if match is not None:
+            return match, _todo_datetime_from_match(match)
+
+    relative_patterns = {
+        "오늘": 0,
+        "내일": 1,
+        "모레": 2,
+    }
+    for word, days in relative_patterns.items():
+        match = re.search(word, message)
+        if match is not None:
+            now = datetime.now(ZoneInfo("Asia/Seoul"))
+            hour, minute = _todo_time_from_message(message, default_hour=23, default_minute=59)
+            due = (now + timedelta(days=days)).replace(
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+            return match, due
+
+    time_match = re.search(
+        r"(?P<ampm>오전|오후|am|pm)?\s*(?P<hour>\d{1,2})\s*(?:시|:)"
+        r"\s*(?P<minute>\d{1,2})?\s*(?:분)?\s*(?:에)?",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if time_match is not None:
+        now = datetime.now(ZoneInfo("Asia/Seoul"))
+        hour, minute = _todo_time_from_message(message, default_hour=23, default_minute=59)
+        due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if due <= now:
+            due += timedelta(days=1)
+        return time_match, due
+    return None, None
+
+
+def _todo_time_from_message(
+    message: str,
+    *,
+    default_hour: int,
+    default_minute: int,
+) -> tuple[int, int]:
+    match = re.search(
+        r"(?P<ampm>오전|오후|am|pm)?\s*(?P<hour>\d{1,2})\s*(?:시|:)"
+        r"\s*(?P<minute>\d{1,2})?\s*(?:분)?",
+        message,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return default_hour, default_minute
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute") or 0)
+    if hour > 23 or minute > 59:
+        return default_hour, default_minute
+    ampm = (match.group("ampm") or "").casefold()
+    if ampm in {"오후", "pm"} and hour < 12:
+        hour += 12
+    elif ampm in {"오전", "am"} and hour == 12:
+        hour = 0
+    return hour, minute
+
+
+def _todo_datetime_from_match(match: re.Match[str]) -> datetime:
+    zone = ZoneInfo("Asia/Seoul")
+    now = datetime.now(zone)
+    month = int(match.group("month"))
+    day = int(match.group("day"))
+    hour = int(match.group("hour") or 23)
+    minute = int(match.group("minute") or 59)
+    due = datetime(now.year, month, day, hour, minute, tzinfo=zone)
+    if due < now:
+        due = due.replace(year=now.year + 1)
+    return due
+
+
 def _local_direct_action_decision(
     message: str,
     *,
@@ -997,25 +1915,19 @@ def _local_direct_action_decision(
     text = message.strip()
     if not text:
         return None
+    if _looks_like_meta_design_or_analysis_request(text):
+        return None
 
-    weather_target = _weather_app_target_from_message(text, context=context)
-    if weather_target and _context_supports_any_action(context, ("app.open", "app_control")):
-        action = ClientAction(
-            type="app_control",
-            command="open",
-            target=weather_target,
-            args={},
-            description=f"Open {weather_target}",
-            requires_confirm=False,
-        )
-        return ActionIntentDecision(
-            should_act=True,
-            execution_mode="direct",
-            intent="app.open",
-            confidence=0.9,
-            reason="local action template: weather app first",
-            actions=[action],
-        )
+    app_open_type_decision = _template_app_open_type_decision_from_text(
+        text,
+        context=context,
+    )
+    if app_open_type_decision is not None:
+        return app_open_type_decision
+
+    app_open_decision = _template_app_open_decision_from_text(text, context=context)
+    if app_open_decision is not None:
+        return app_open_decision
 
     url = _open_url_from_message(text)
     if url and _context_supports_any_action(context, ("open_url", "browser.navigate")):
@@ -1036,56 +1948,7 @@ def _local_direct_action_decision(
             actions=[action],
         )
 
-    app_target = _application_open_target_from_message(text, context=context)
-    if app_target and _context_supports_any_action(context, ("app.open", "app_control")):
-        action = ClientAction(
-            type="app_control",
-            command="open",
-            target=app_target,
-            args={},
-            description=f"Open {app_target}",
-            requires_confirm=False,
-        )
-        return ActionIntentDecision(
-            should_act=True,
-            execution_mode="direct",
-            intent="app.open",
-            confidence=0.9,
-            reason="local action template: explicit app open",
-            actions=[action],
-        )
-
-    terminal_action = _terminal_action_from_message(text, context=context)
-    if terminal_action is not None:
-        return ActionIntentDecision(
-            should_act=True,
-            execution_mode="direct",
-            intent="terminal.run",
-            confidence=0.88,
-            reason="local action template: terminal command",
-            actions=[terminal_action],
-        )
-
-    result_index = _browser_result_index_from_message(text)
-    if result_index is not None and _browser_context_active(context):
-        action = ClientAction(
-            type="browser_control",
-            command="select_result",
-            target=None,
-            args={"index": result_index},
-            description="Open browser search result",
-            requires_confirm=False,
-        )
-        return ActionIntentDecision(
-            should_act=True,
-            execution_mode="direct",
-            intent="browser.select_result",
-            confidence=0.9,
-            reason="local action template: browser result selection",
-            actions=[action],
-        )
-
-    query = _browser_search_query_from_message(text)
+    query = _browser_search_query_from_message(text, context=context)
     if query and _context_supports_any_action(
         context,
         ("open_url", "browser.search", "browser.navigate", "browser"),
@@ -1104,6 +1967,69 @@ def _local_direct_action_decision(
             intent="browser.search",
             confidence=0.92,
             reason="local action template: explicit browser search",
+            actions=[action],
+        )
+
+    terminal_action = _terminal_action_from_message(text, context=context)
+    if terminal_action is not None:
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="terminal.run",
+            confidence=0.88,
+            reason="local action template: terminal command",
+            actions=[terminal_action],
+        )
+
+    todo_delete_action = _todo_delete_action_from_message(text)
+    if todo_delete_action is not None:
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="todo.delete",
+            confidence=0.88,
+            reason="local action template: todo delete",
+            actions=[todo_delete_action],
+        )
+
+    todo_action = _todo_create_action_from_message(text)
+    if todo_action is not None:
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="todo.create",
+            confidence=0.9,
+            reason="local action template: todo create",
+            actions=[todo_action],
+        )
+
+    todo_list_action = _todo_list_action_from_message(text)
+    if todo_list_action is not None:
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="todo.list",
+            confidence=0.9,
+            reason="local action template: todo list",
+            actions=[todo_list_action],
+        )
+
+    result_index = _browser_result_index_from_message(text)
+    if result_index is not None and _browser_context_active(context):
+        action = ClientAction(
+            type="browser_control",
+            command="select_result",
+            target=None,
+            args={"index": result_index},
+            description="Open browser search result",
+            requires_confirm=False,
+        )
+        return ActionIntentDecision(
+            should_act=True,
+            execution_mode="direct",
+            intent="browser.select_result",
+            confidence=0.9,
+            reason="local action template: browser result selection",
             actions=[action],
         )
 
@@ -1197,24 +2123,39 @@ def _browser_result_index_from_message(message: str) -> int | None:
     return None
 
 
-def _browser_search_query_from_message(message: str) -> str | None:
+def _browser_search_query_from_message(
+    message: str,
+    *,
+    context: dict[str, object] | None = None,
+) -> str | None:
     folded = message.casefold()
     browserish = any(
         term in folded
         for term in ("브라우저", "크롬", "chrome", "browser", "google", "구글", "naver", "네이버")
     )
     searchish = any(term in folded for term in ("검색", "찾아", "search", "find", "look up"))
+    explicit_searchish = any(
+        term in folded
+        for term in ("검색", "서치", "search", "look up", "lookup")
+    )
     pageish = any(
         term in folded
         for term in ("페이지", "사이트", "들어가", "열어", "open", "go to", "navigate")
     )
-    if not (browserish and (searchish or pageish)):
+    if not ((browserish and (searchish or pageish)) or explicit_searchish):
         return None
     if _browser_open_requested(folded) and not (
         searchish or _has_query_after_browser_framing(message)
     ):
         return None
     query = normalize_browser_search_query(message)
+    if _browser_search_query_is_followup_placeholder(message, query):
+        previous_query = _previous_user_message_search_query(context)
+        if previous_query:
+            return previous_query
+        return None
+    if _browser_search_query_is_vague(query):
+        return None
     if not query or _browser_open_requested(query.casefold()):
         return None
     return query
@@ -1223,6 +2164,119 @@ def _browser_search_query_from_message(message: str) -> str | None:
 def _has_query_after_browser_framing(message: str) -> bool:
     query = normalize_browser_search_query(message)
     return bool(query and query.casefold() != message.strip().casefold())
+
+
+def _browser_search_query_is_followup_placeholder(message: str, query: str) -> bool:
+    folded = message.casefold()
+    if not any(
+        term in folded
+        for term in ("브라우저", "크롬", "chrome", "browser", "google", "구글", "naver", "네이버")
+    ):
+        return False
+    reduced = _normalized_action_match_key(query)
+    original = _normalized_action_match_key(message)
+    return reduced in {
+        "",
+        "찾아줘",
+        "찾아봐",
+        "검색해줘",
+        "검색해",
+        "search",
+        "find",
+        "lookup",
+    } or original in {
+        "브라우저에서찾아줘",
+        "브라우저에서검색해줘",
+        "브라우저로찾아줘",
+        "브라우저로검색해줘",
+        "크롬에서찾아줘",
+        "크롬에서검색해줘",
+    }
+
+
+def _browser_search_query_is_vague(query: str) -> bool:
+    return _normalized_action_match_key(query) in {
+        "",
+        "검색",
+        "검색해",
+        "검색해줘",
+        "검색해봐",
+        "검색해줄래",
+        "검색해서",
+        "서치",
+        "search",
+        "find",
+        "lookup",
+    }
+
+
+def _previous_user_message_search_query(
+    context: dict[str, object] | None,
+) -> str | None:
+    if not context:
+        return None
+    previous = context.get("previous_user_message")
+    text = None
+    if isinstance(previous, dict):
+        value = previous.get("text")
+        if isinstance(value, str):
+            text = value
+    elif isinstance(previous, str):
+        text = previous
+    if not text or not text.strip():
+        return None
+    query = normalize_browser_search_query(text)
+    if _browser_search_query_is_followup_placeholder(text, query):
+        return None
+    return query if query and not _browser_open_requested(query.casefold()) else None
+
+
+def _local_previous_user_message_response(
+    message: str,
+    *,
+    context: dict[str, object] | None,
+) -> str | None:
+    if not _previous_user_message_requested(message):
+        return None
+    previous = _previous_user_message_text(context)
+    if previous is None:
+        return "기록된 이전 질문이 없습니다."
+    return f"이전 질문은 \"{previous}\"였습니다."
+
+
+def _previous_user_message_requested(message: str) -> bool:
+    folded = message.casefold()
+    message_key = _normalized_action_match_key(message)
+    has_previous_reference = any(
+        term in folded
+        for term in ("이전", "직전", "방금", "마지막", "last", "previous")
+    )
+    has_question_reference = any(
+        term in folded
+        for term in ("질문", "말", "뭐라", "뭐라고", "뭐였", "asked", "said")
+    )
+    compact_patterns = (
+        "내가뭐라",
+        "내가뭐라고",
+        "뭐라고했",
+        "뭐라했",
+    )
+    return (has_previous_reference and has_question_reference) or any(
+        pattern in message_key for pattern in compact_patterns
+    )
+
+
+def _previous_user_message_text(context: dict[str, object] | None) -> str | None:
+    if not context:
+        return None
+    previous = context.get("previous_user_message")
+    if isinstance(previous, dict):
+        value = previous.get("text")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if isinstance(previous, str) and previous.strip():
+        return previous.strip()
+    return None
 
 
 def _browser_open_requested(folded_message: str) -> bool:
@@ -1444,12 +2498,6 @@ def _stream_realtime_with_action_arbitration(
             )
         ]
         if _is_direct_action_decision(decision):
-            chunks.append(
-                _sse_event(
-                    "assistant_delta",
-                    {"request_id": request_id, "content": _ACTION_ACK},
-                )
-            )
             chunks.extend(
                 _stream_direct_action_decision(
                     decision=decision,
@@ -1889,7 +2937,57 @@ def _client_action_context(
     )
     if working_context is not None:
         context["working_context"] = working_context
+    previous_user_message = _previous_user_message_context(
+        request=request,
+        user_id=user_id,
+    )
+    if previous_user_message is not None:
+        context["previous_user_message"] = previous_user_message
     return context or None
+
+
+def _previous_user_message_context(
+    *,
+    request: Request,
+    user_id: str,
+) -> dict[str, object] | None:
+    memory = _user_message_memory(request)
+    record = memory.get(user_id)
+    if not isinstance(record, dict):
+        return None
+    updated_at = record.get("updated_at")
+    text = record.get("text")
+    if not isinstance(updated_at, int | float):
+        return None
+    if time.monotonic() - float(updated_at) > _RECENT_USER_MESSAGE_TTL_SECONDS:
+        memory.pop(user_id, None)
+        return None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    return {"text": text.strip()}
+
+
+def _record_user_message_context(
+    *,
+    request: Request,
+    user_id: str,
+    message: str,
+) -> None:
+    text = message.strip()
+    if not text:
+        return
+    _user_message_memory(request)[user_id] = {
+        "text": text,
+        "updated_at": time.monotonic(),
+    }
+
+
+def _user_message_memory(request: Request) -> dict[str, dict[str, object]]:
+    memory = getattr(request.app.state, "recent_user_messages", None)
+    if isinstance(memory, dict):
+        return memory
+    request.app.state.recent_user_messages = {}
+    return request.app.state.recent_user_messages
 
 
 def _latest_observation_context(
@@ -1980,13 +3078,13 @@ def _trim_action_context_for_message(
                 if isinstance(name, str):
                     matched_names.append(name)
     else:
-        matched_names = [
-            name
-            for name in names
-            if isinstance(name, str)
-            and name.strip()
-            and name.casefold() in message_key
-        ]
+        matched_names = []
+        for name in names:
+            if not isinstance(name, str) or not name.strip():
+                continue
+            candidates = [name, *_local_app_aliases_for_name(name)]
+            if any(candidate.strip().casefold() in message_key for candidate in candidates):
+                matched_names.append(name)
     trimmed = dict(context)
     if matched_apps:
         trimmed["available_applications"] = matched_apps[:30]
@@ -2093,6 +3191,14 @@ def _runtime_applications_for_context(value: object) -> list[dict[str, object]]:
         return []
     applications: list[dict[str, object]] = []
     for item in value[:_action_context_application_limit()]:
+        if isinstance(item, str):
+            name = item.strip()
+            if not name:
+                continue
+            app = {"name": name}
+            _enrich_runtime_application_aliases(app)
+            applications.append(app)
+            continue
         if not isinstance(item, dict):
             continue
         name = item.get("name")
@@ -2120,6 +3226,21 @@ def _enrich_runtime_application_aliases(app: dict[str, object]) -> None:
         merged = _string_list(app.get(key))
         merged.extend(values)
         app[key] = list(dict.fromkeys(merged))[:12]
+
+
+def _local_app_aliases_for_name(app_name: str) -> list[str]:
+    app_key = _normalized_action_match_key(app_name)
+    if not app_key:
+        return []
+    for bundle_id, profile in _LOCAL_APP_ALIAS_PROFILE.items():
+        bundle_key = _normalized_action_match_key(bundle_id)
+        candidates = []
+        for values in profile.values():
+            candidates.extend(values)
+        candidate_keys = {_normalized_action_match_key(candidate) for candidate in candidates}
+        if app_key == bundle_key or app_key in candidate_keys:
+            return list(dict.fromkeys(candidates))
+    return []
 
 
 def _local_app_alias_profile_for_app(
@@ -2439,6 +3560,51 @@ def _stream_direct_action_decision(
     )
 
 
+def _stream_local_text_response(
+    *,
+    request_id: str,
+    content: str,
+    confidence: float = 0.98,
+    reason: str = "local conversation context",
+) -> Generator[bytes, None, None]:
+    step_id = f"{request_id}:text"
+    yield _sse_event(
+        "classification",
+        {
+            "category": "general",
+            "mode": ConversationMode.REALTIME.value,
+            "confidence": confidence,
+            "reasons": [reason],
+        },
+    )
+    yield _sse_event(
+        "plan_step",
+        {
+            "id": step_id,
+            "title": "텍스트 응답 작성",
+            "description": "요청에 대한 답변을 생성 중입니다.",
+            "status": "in_progress",
+        },
+    )
+    yield _sse_event("assistant_delta", {"content": content})
+    yield _sse_event(
+        "plan_step",
+        {
+            "id": step_id,
+            "title": "텍스트 응답 작성",
+            "description": "요청에 대한 답변을 생성 중입니다.",
+            "status": "completed",
+        },
+    )
+    yield _sse_event(
+        "assistant_done",
+        {
+            "content": content,
+            "summary": reason,
+        },
+    )
+
+
 def _deepthink_step_payload(step) -> dict[str, object]:
     return {"id": step.id, "title": step.title, "description": step.description}
 
@@ -2554,12 +3720,103 @@ def _merge_action_completion_into_response(
     return f"{content}\n\n{action_content}".strip(), action_summary
 
 
+def _turn_cancellation_store(request: Request):
+    store = getattr(request.app.state, "turn_cancellation", None)
+    if store is None:
+        from planner.turn_cancellation import TurnCancellationStore
+
+        store = TurnCancellationStore()
+        request.app.state.turn_cancellation = store
+    return store
+
+
+def _cancel_pending_actions_for_turn(
+    *,
+    request: Request,
+    user_id: str,
+    request_id: str | None,
+    reason: str,
+) -> int:
+    if not request_id:
+        return 0
+    dispatcher = getattr(request.app.state, "action_dispatcher", None)
+    if dispatcher is None or not hasattr(dispatcher, "cancel_request"):
+        return 0
+    return dispatcher.cancel_request(
+        user_id=user_id,
+        request_id=request_id,
+        reason=reason,
+    )
+
+
+def _conversation_cancelled_chunk(
+    *,
+    request_id: str,
+    reason: str,
+) -> bytes:
+    return _sse_event(
+        "conversation.cancelled",
+        {
+            "request_id": request_id,
+            "reason": reason,
+        },
+    )
+
+
 def _stream_orchestrated_conversation(
     req: ConversationRequest,
     request: Request,
     principal,
 ) -> Generator[bytes, None, None]:
     request_id = request.headers.get("x-request-id") or f"req_{uuid4().hex}"
+    turn_store = _turn_cancellation_store(request)
+    previous_request_id = turn_store.begin_turn(
+        user_id=principal.user_id,
+        request_id=request_id,
+        reason="barge_in",
+    )
+    _cancel_pending_actions_for_turn(
+        request=request,
+        user_id=principal.user_id,
+        request_id=previous_request_id,
+        reason="barge_in",
+    )
+    try:
+        inner_stream = _stream_orchestrated_conversation_inner(
+            req,
+            request,
+            principal,
+            request_id=request_id,
+        )
+        response_stream = _stream_with_live_tts(
+            inner_stream,
+            req=req,
+            request_id=request_id,
+            user_id=principal.user_id,
+        )
+        for chunk in response_stream:
+            cancellation = turn_store.cancellation(
+                user_id=principal.user_id,
+                request_id=request_id,
+            )
+            if cancellation is not None:
+                yield _conversation_cancelled_chunk(
+                    request_id=request_id,
+                    reason=cancellation.reason,
+                )
+                return
+            yield chunk
+    finally:
+        turn_store.finish_turn(user_id=principal.user_id, request_id=request_id)
+
+
+def _stream_orchestrated_conversation_inner(
+    req: ConversationRequest,
+    request: Request,
+    principal,
+    *,
+    request_id: str,
+) -> Generator[bytes, None, None]:
 
     action_executor: concurrent.futures.ThreadPoolExecutor | None = None
     action_future: concurrent.futures.Future[ActionIntentDecision | None] | None = None
@@ -2573,14 +3830,32 @@ def _stream_orchestrated_conversation(
         client_action_context,
         req.message,
     )
+    local_text_response = _local_previous_user_message_response(
+        req.message,
+        context=trimmed_action_context,
+    )
+    _record_user_message_context(
+        request=request,
+        user_id=principal.user_id,
+        message=req.message,
+    )
     routing_context = ConversationContext(
         recent_failures=req.recent_failures,
         ambiguity_count=req.ambiguity_count,
         turn_index=req.turn_index,
     )
     route_override = req.override.value if req.override else None
+    obvious_decision: RoutingDecision | None = None
 
     if route_override in (None, ConversationMode.REALTIME.value):
+        if local_text_response is not None and req.override != ContractConversationMode.PLANNING:
+            yield from _stream_local_text_response(
+                request_id=request_id,
+                content=local_text_response,
+                reason="local previous user message recall",
+            )
+            return
+
         if req.override != ContractConversationMode.PLANNING:
             local_decision = _local_direct_action_decision(
                 req.message,
@@ -2591,7 +3866,6 @@ def _stream_orchestrated_conversation(
                     "action_intent",
                     _action_intent_payload(local_decision),
                 )
-                yield _sse_event("assistant_delta", {"content": _ACTION_ACK})
                 yield from _stream_direct_action_decision(
                     decision=local_decision,
                     message=req.message,
@@ -2601,7 +3875,10 @@ def _stream_orchestrated_conversation(
                 )
                 return
 
-            if _looks_like_direct_client_action_request(
+            if route_override is None:
+                obvious_decision = _obvious_non_realtime_decision(req.message)
+
+            if obvious_decision is None and _looks_like_direct_client_action_request(
                 req.message,
                 context=trimmed_action_context,
             ):
@@ -2612,44 +3889,45 @@ def _stream_orchestrated_conversation(
                     context=trimmed_action_context,
                 )
 
-        if route_override is None:
-            route_executor, route_future = _start_routing_decision_future(
-                req.message,
-                override=None,
-                context=routing_context,
-            )
-        try:
-            stream = request.app.state.core_client.chat_stream(
-                message=req.message,
-                task_type="general",
-                confirm=False,
-                route_override="realtime",
-                user_id=principal.user_id,
-                user_email=getattr(principal, "email", ""),
-                request_id=request_id,
-            )
-            yield from _stream_realtime_with_parallel_decisions(
-                stream,
-                action_future=action_future,
-                route_future=route_future,
-                request_id=request_id,
-                message=req.message,
-                user_id=principal.user_id,
-                action_dispatcher=request.app.state.action_dispatcher,
-                context=client_action_context,
-            )
-        finally:
-            if action_future is not None:
-                action_future.cancel()
-            if action_executor is not None:
-                action_executor.shutdown(wait=False, cancel_futures=True)
-            if route_future is not None:
-                route_future.cancel()
-            if route_executor is not None:
-                route_executor.shutdown(wait=False, cancel_futures=True)
-        return
+        if obvious_decision is None:
+            if route_override is None:
+                route_executor, route_future = _start_routing_decision_future(
+                    req.message,
+                    override=None,
+                    context=routing_context,
+                )
+            try:
+                stream = request.app.state.core_client.chat_stream(
+                    message=req.message,
+                    task_type="general",
+                    confirm=False,
+                    route_override="realtime",
+                    user_id=principal.user_id,
+                    user_email=getattr(principal, "email", ""),
+                    request_id=request_id,
+                )
+                yield from _stream_realtime_with_parallel_decisions(
+                    stream,
+                    action_future=action_future,
+                    route_future=route_future,
+                    request_id=request_id,
+                    message=req.message,
+                    user_id=principal.user_id,
+                    action_dispatcher=request.app.state.action_dispatcher,
+                    context=client_action_context,
+                )
+            finally:
+                if action_future is not None:
+                    action_future.cancel()
+                if action_executor is not None:
+                    action_executor.shutdown(wait=False, cancel_futures=True)
+                if route_future is not None:
+                    route_future.cancel()
+                if route_executor is not None:
+                    route_executor.shutdown(wait=False, cancel_futures=True)
+            return
 
-    decision = evaluate_conversation_mode(
+    decision = obvious_decision or evaluate_conversation_mode(
         req.message,
         override=route_override,
         context=routing_context,
@@ -2658,6 +3936,20 @@ def _stream_orchestrated_conversation(
 
     for chunk in _classification_chunks_for_decision(decision):
         yield chunk
+
+    if obvious_decision is not None and req.override is None:
+        stream = request.app.state.core_client.chat_stream(
+            message=req.message,
+            task_type="analysis",
+            confirm=False,
+            route_override="deep",
+            user_id=principal.user_id,
+            user_email=getattr(principal, "email", ""),
+            request_id=request_id,
+        )
+        for chunk in _stream_without_leading_action_ack(stream):
+            yield chunk
+        return
 
     action_decision: ActionIntentDecision | None = None
     if (
@@ -2889,6 +4181,292 @@ def health() -> dict[str, object]:
     }
 
 
+@api_router.get("/tts-test", tags=["health"], summary="Browser TTS test page")
+def tts_test_page() -> HTMLResponse:
+    return HTMLResponse(
+        """
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JARVIS TTS Test</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f1ea;
+      --ink: #1f2522;
+      --muted: #65716c;
+      --line: #d7d0c3;
+      --panel: #fffaf1;
+      --accent: #0f766e;
+      --accent-dark: #0b5e58;
+      --bad: #b42318;
+      --good: #067647;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        linear-gradient(135deg, rgba(15,118,110,.12), transparent 34%),
+        linear-gradient(225deg, rgba(173,107,34,.12), transparent 38%),
+        var(--bg);
+      color: var(--ink);
+      font-family: ui-sans-serif, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+    }
+    main { width: min(1120px, calc(100% - 32px)); margin: 32px auto; }
+    h1 { margin: 0 0 6px; font-size: clamp(28px, 4vw, 48px); letter-spacing: 0; }
+    p { margin: 0; color: var(--muted); }
+    .grid { display: grid; grid-template-columns: 360px 1fr; gap: 18px; margin-top: 24px; }
+    section {
+      background: color-mix(in srgb, var(--panel) 92%, white);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+      box-shadow: 0 12px 35px rgba(40, 35, 28, .08);
+    }
+    label { display: grid; gap: 6px; margin: 12px 0; font-weight: 700; }
+    input, textarea, select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 12px;
+      font: inherit;
+      background: #fffef9;
+      color: var(--ink);
+    }
+    textarea { min-height: 128px; resize: vertical; line-height: 1.55; }
+    button {
+      border: 0;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font: inherit;
+      font-weight: 800;
+      color: white;
+      background: var(--accent);
+      cursor: pointer;
+    }
+    button:hover { background: var(--accent-dark); }
+    button.secondary { background: #3d4b46; }
+    button.stop { background: var(--bad); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .metric {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 14px 0;
+    }
+    .metric div { border: 1px solid var(--line); border-radius: 6px; padding: 10px; background: #fffef9; }
+    .metric strong { display: block; font-size: 20px; }
+    pre {
+      min-height: 220px;
+      max-height: 380px;
+      overflow: auto;
+      white-space: pre-wrap;
+      background: #111816;
+      color: #d9f2e6;
+      border-radius: 8px;
+      padding: 14px;
+    }
+    @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } .metric { grid-template-columns: 1fr 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>JARVIS TTS Test</h1>
+  <p>직접 PCM TTS와 대화 병렬 TTS의 지연 시간을 브라우저에서 비교합니다.</p>
+  <div class="grid">
+    <section>
+      <label>Bearer token <input id="token" type="password" placeholder="Authorization token" /></label>
+      <label>Voice <input id="voice" value="default" /></label>
+      <label>Model <input id="model" placeholder="비우면 서버 기본값" /></label>
+      <label>Sample rate <select id="sampleRate"><option>24000</option><option>16000</option><option>48000</option></select></label>
+      <div class="row">
+        <button id="directBtn">직접 TTS 테스트</button>
+        <button id="liveBtn" class="secondary">대화+라이브 TTS</button>
+        <button id="stopBtn" class="stop">중지</button>
+      </div>
+    </section>
+    <section>
+      <label>Text / Message
+        <textarea id="text">안녕하세요. 지금 실시간 한국어 음성 합성 속도를 테스트하고 있습니다. 첫 오디오가 나오는 시간과 전체 생성 시간을 확인합니다.</textarea>
+      </label>
+      <div class="metric">
+        <div><span>TTFB</span><strong id="ttfb">-</strong></div>
+        <div><span>Audio bytes</span><strong id="bytes">0</strong></div>
+        <div><span>Total</span><strong id="total">-</strong></div>
+        <div><span>Status</span><strong id="status">idle</strong></div>
+      </div>
+      <pre id="log"></pre>
+    </section>
+  </div>
+</main>
+<script>
+let aborter = null;
+let audioContext = null;
+let nextPlayTime = 0;
+
+const $ = (id) => document.getElementById(id);
+const log = (msg) => {
+  const now = new Date().toLocaleTimeString();
+  $("log").textContent += `[${now}] ${msg}\\n`;
+  $("log").scrollTop = $("log").scrollHeight;
+};
+const authHeaders = () => {
+  const token = $("token").value.trim();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+};
+const resetMetrics = () => {
+  $("ttfb").textContent = "-";
+  $("bytes").textContent = "0";
+  $("total").textContent = "-";
+  $("status").textContent = "running";
+  $("log").textContent = "";
+};
+const ttsConfig = () => {
+  const model = $("model").value.trim();
+  const body = {
+    voice: $("voice").value.trim() || "default",
+    sample_rate: Number($("sampleRate").value),
+    channels: 1,
+    sample_width: 2,
+    format: "pcm_s16le",
+  };
+  if (model) body.model = model;
+  return body;
+};
+const ensureAudio = async (sampleRate) => {
+  if (!audioContext || audioContext.sampleRate !== sampleRate) {
+    audioContext = new AudioContext({ sampleRate });
+    nextPlayTime = audioContext.currentTime;
+  }
+  if (audioContext.state === "suspended") await audioContext.resume();
+};
+const playPcm16 = async (chunk, sampleRate) => {
+  await ensureAudio(sampleRate);
+  const view = new DataView(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  const frames = Math.floor(chunk.byteLength / 2);
+  const audioBuffer = audioContext.createBuffer(1, frames, sampleRate);
+  const data = audioBuffer.getChannelData(0);
+  for (let i = 0; i < frames; i++) data[i] = view.getInt16(i * 2, true) / 32768;
+  const source = audioContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioContext.destination);
+  nextPlayTime = Math.max(nextPlayTime, audioContext.currentTime + 0.03);
+  source.start(nextPlayTime);
+  nextPlayTime += audioBuffer.duration;
+};
+const readAudioStream = async (response, startedAt, sampleRate) => {
+  if (!response.ok || !response.body) throw new Error(`audio ${response.status}`);
+  const reader = response.body.getReader();
+  let first = true;
+  let totalBytes = 0;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    if (first) {
+      first = false;
+      $("ttfb").textContent = `${Math.round(performance.now() - startedAt)}ms`;
+      log("first audio chunk received");
+    }
+    totalBytes += value.byteLength;
+    $("bytes").textContent = String(totalBytes);
+    await playPcm16(value, sampleRate);
+  }
+  $("total").textContent = `${Math.round(performance.now() - startedAt)}ms`;
+  $("status").textContent = "done";
+};
+const parseSse = (buffer) => {
+  const events = [];
+  const parts = buffer.split("\\n\\n");
+  const rest = parts.pop();
+  for (const part of parts) {
+    let event = "message";
+    const data = [];
+    for (const line of part.split("\\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim();
+      if (line.startsWith("data:")) data.push(line.slice(5).trim());
+    }
+    if (data.length) events.push({ event, data: data.join("\\n") });
+  }
+  return { events, rest };
+};
+const directTts = async () => {
+  aborter = new AbortController();
+  resetMetrics();
+  const startedAt = performance.now();
+  const sampleRate = Number($("sampleRate").value);
+  const body = { ...ttsConfig(), chunks: [{ id: "browser-test", text: $("text").value }] };
+  log("POST /audio/speech/pcm");
+  const res = await fetch("/audio/speech/pcm", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+    signal: aborter.signal,
+  });
+  await readAudioStream(res, startedAt, sampleRate);
+};
+const liveTts = async () => {
+  aborter = new AbortController();
+  resetMetrics();
+  const startedAt = performance.now();
+  const body = {
+    message: $("text").value,
+    tts_enabled: true,
+    tts_voice: $("voice").value.trim() || "default",
+    tts_model: $("model").value.trim() || null,
+    tts_sample_rate: Number($("sampleRate").value),
+    tts_channels: 1,
+    tts_sample_width: 2,
+  };
+  log("POST /conversation/stream");
+  const res = await fetch("/conversation/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body),
+    signal: aborter.signal,
+  });
+  if (!res.ok || !res.body) throw new Error(`conversation ${res.status}`);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const parsed = parseSse(buffer);
+    buffer = parsed.rest;
+    for (const item of parsed.events) {
+      if (item.event === "assistant_delta") {
+        const payload = JSON.parse(item.data);
+        if (payload.content) log(`text: ${payload.content}`);
+      }
+      if (item.event === "tts_session") {
+        const payload = JSON.parse(item.data);
+        log(`GET ${payload.stream_url}`);
+        readAudioStream(
+          await fetch(payload.stream_url, { headers: authHeaders(), signal: aborter.signal }),
+          startedAt,
+          payload.sample_rate
+        ).catch((error) => {
+          $("status").textContent = "error";
+          log(error.message);
+        });
+      }
+    }
+  }
+};
+$("directBtn").onclick = () => directTts().catch((error) => { $("status").textContent = "error"; log(error.message); });
+$("liveBtn").onclick = () => liveTts().catch((error) => { $("status").textContent = "error"; log(error.message); });
+$("stopBtn").onclick = () => { if (aborter) aborter.abort(); $("status").textContent = "stopped"; };
+</script>
+</body>
+</html>
+        """.strip()
+    )
+
+
 # ── auth ────────────────────────────────────────────────────
 
 
@@ -3113,6 +4691,40 @@ def respond(
 
 
 @api_router.post(
+    "/conversation/cancel",
+    tags=["conversation"],
+    summary="Cancel the active or specified conversation turn",
+)
+def conversation_cancel(
+    req: ConversationCancelRequest,
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+) -> dict[str, object]:
+    _ = authorization_header
+    principal = request.state.principal
+    reason = req.reason.strip() or "barge_in"
+    turn_store = _turn_cancellation_store(request)
+    cancelled_request_id = turn_store.cancel_turn(
+        user_id=principal.user_id,
+        request_id=req.request_id,
+        reason=reason,
+    )
+    cancelled_actions = _cancel_pending_actions_for_turn(
+        request=request,
+        user_id=principal.user_id,
+        request_id=cancelled_request_id,
+        reason=reason,
+    )
+    return {
+        "cancelled": cancelled_request_id is not None,
+        "request_id": cancelled_request_id,
+        "reason": reason,
+        "cancelled_actions": cancelled_actions,
+    }
+
+
+@api_router.post(
     "/conversation/stream",
     tags=["conversation"],
     summary="Stream orchestrated conversation response",
@@ -3191,7 +4803,7 @@ def _stream_chat_with_routing(
                 request_id=request_id,
             )
             if should_try_client_action_classifier(req.message):
-                yield from _stream_realtime_with_action_arbitration(
+                response_stream = _stream_realtime_with_action_arbitration(
                     stream,
                     action_future=action_future,
                     request_id=request_id,
@@ -3204,11 +4816,17 @@ def _stream_chat_with_routing(
                     ),
                 )
             else:
-                yield from _stream_with_model_logging(
+                response_stream = _stream_with_model_logging(
                     stream,
                     request_id=request_id,
                     message=req.message,
                 )
+            yield from _stream_with_live_tts(
+                response_stream,
+                req=req,
+                request_id=request_id,
+                user_id=principal.user_id,
+            )
         finally:
             if action_future is not None:
                 action_future.cancel()
@@ -3233,7 +4851,7 @@ def _stream_chat_with_routing(
             user_email=getattr(principal, "email", ""),
             request_id=request_id,
         )
-        yield from _stream_realtime_with_parallel_decisions(
+        response_stream = _stream_realtime_with_parallel_decisions(
             stream,
             action_future=action_future,
             route_future=route_future,
@@ -3245,6 +4863,12 @@ def _stream_chat_with_routing(
                 request=request,
                 user_id=principal.user_id,
             ),
+        )
+        yield from _stream_with_live_tts(
+            response_stream,
+            req=req,
+            request_id=request_id,
+            user_id=principal.user_id,
         )
     finally:
         action_future.cancel()
@@ -3272,6 +4896,95 @@ def chat_stream(
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+# ── audio ───────────────────────────────────────────────────
+
+
+@api_router.post("/audio/speech", tags=["audio"], summary="Synthesize speech")
+def synthesize_speech(
+    req: TextToSpeechRequest,
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+) -> Response:
+    _ = authorization_header
+    principal = request.state.principal
+    request_id = request.headers.get("x-request-id", "")
+    result = request.app.state.core_client.synthesize_speech(
+        user_id=principal.user_id,
+        body=req.model_dump(exclude_none=True),
+        request_id=request_id,
+    )
+    return Response(
+        content=result.content,
+        media_type=result.media_type,
+        headers=result.headers,
+    )
+
+
+@api_router.post("/audio/speech/pcm", tags=["audio"], summary="Stream speech PCM")
+def synthesize_speech_pcm(
+    req: TextToSpeechPCMRequest,
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+) -> StreamingResponse:
+    _ = authorization_header
+    principal = request.state.principal
+    request_id = request.headers.get("x-request-id", "")
+    result = request.app.state.core_client.synthesize_speech_pcm_stream(
+        user_id=principal.user_id,
+        body=req.model_dump(exclude_none=True),
+        request_id=request_id,
+    )
+    return StreamingResponse(
+        result.body,
+        media_type=result.media_type,
+        headers=result.headers,
+    )
+
+
+@api_router.get("/audio/speech/live/{session_id}", tags=["audio"], summary="Stream live turn speech PCM")
+def synthesize_live_speech_pcm(
+    session_id: str,
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+) -> StreamingResponse:
+    _ = authorization_header
+    principal = request.state.principal
+    session = _LIVE_TTS_SESSIONS.get(session_id)
+    if session is None or session.user_id != principal.user_id:
+        raise HTTPException(status_code=404, detail="tts session not found")
+    return StreamingResponse(
+        _stream_live_tts_pcm(session=session, request=request),
+        media_type="audio/pcm",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "X-TTS-Format": "pcm_s16le",
+            "X-TTS-Sample-Rate": str(session.config["sample_rate"]),
+            "X-TTS-Channels": str(session.config["channels"]),
+            "X-TTS-Sample-Width": str(session.config["sample_width"]),
+        },
+    )
+
+
+@api_router.get("/audio/speech/models", tags=["audio"], summary="List TTS models")
+def list_speech_models(
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+) -> dict[str, object]:
+    _ = authorization_header
+    principal = request.state.principal
+    request_id = request.headers.get("x-request-id", "")
+    return request.app.state.core_client.list_speech_models(
+        user_id=principal.user_id,
+        request_id=request_id,
     )
 
 
@@ -3459,6 +5172,90 @@ def list_memory(
     return request.app.state.core_client.list_memory(
         user_id=principal.user_id,
         chat_id=chat_id,
+    )
+
+
+# ── todos ──────────────────────────────────────────────────
+
+
+@api_router.post("/todos", tags=["todos"], summary="Create todo")
+def create_todo(
+    req: TodoCreateRequest,
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+):
+    _ = authorization_header
+    principal = request.state.principal
+    return request.app.state.core_client.create_todo(
+        user_id=principal.user_id,
+        body=req.model_dump(mode="json"),
+    )
+
+
+@api_router.get("/todos", tags=["todos"], summary="List todos")
+def list_todos(
+    request: Request,
+    status: str | None = None,
+    include_deleted: bool = False,
+    limit: int = 50,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+):
+    _ = authorization_header
+    principal = request.state.principal
+    return request.app.state.core_client.list_todos(
+        user_id=principal.user_id,
+        status=status,
+        include_deleted=include_deleted,
+        limit=limit,
+    )
+
+
+@api_router.get("/todos/{todo_id}", tags=["todos"], summary="Get todo")
+def get_todo(
+    todo_id: str,
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+):
+    _ = authorization_header
+    principal = request.state.principal
+    return request.app.state.core_client.get_todo(
+        user_id=principal.user_id,
+        todo_id=todo_id,
+    )
+
+
+@api_router.patch("/todos/{todo_id}", tags=["todos"], summary="Update todo")
+def update_todo(
+    todo_id: str,
+    req: TodoUpdateRequest,
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+):
+    _ = authorization_header
+    principal = request.state.principal
+    return request.app.state.core_client.update_todo(
+        user_id=principal.user_id,
+        todo_id=todo_id,
+        body=req.model_dump(exclude_unset=True, mode="json"),
+    )
+
+
+@api_router.delete("/todos/{todo_id}", tags=["todos"], summary="Delete todo")
+def delete_todo(
+    todo_id: str,
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+):
+    _ = authorization_header
+    principal = request.state.principal
+    return request.app.state.core_client.delete_todo(
+        user_id=principal.user_id,
+        todo_id=todo_id,
     )
 
 

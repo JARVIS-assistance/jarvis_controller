@@ -304,6 +304,13 @@ class ActionCompiler:
             and not gate.should_act
             and gate.confidence >= _action_intent_confidence_threshold()
         ):
+            search_decision = self._decision_from_explicit_browser_search_text(
+                message,
+                confidence=gate.confidence,
+                context=context,
+            )
+            if search_decision is not None:
+                return search_decision
             app_preference_decision = self._decision_from_fresh_context_app_text(
                 message,
                 confidence=gate.confidence,
@@ -854,13 +861,18 @@ class ActionCompiler:
     ) -> ActionIntentDecision | None:
         if not _gate_template_is_grounded(gate, message=message, context=context):
             return None
-        return self._decision_from_gate_template(gate, context=context)
+        return self._decision_from_gate_template(
+            gate,
+            context=context,
+            message=message,
+        )
 
     def _decision_from_gate_template(
         self,
         gate: ActionIntentGate,
         *,
         context: dict[str, Any] | None,
+        message: str = "",
     ) -> ActionIntentDecision | None:
         materialized = materialize_gate_template(gate, context=context)
         plan = materialized.plan
@@ -872,6 +884,18 @@ class ActionCompiler:
                 gate.intent,
             )
             return self._decision_from_plan(plan, message="", context=context)
+        if (
+            issues
+            and message
+            and _gate_template_missing_search_query(gate, issues)
+        ):
+            search_decision = self._decision_from_explicit_browser_search_text(
+                message,
+                confidence=gate.confidence,
+                context=context,
+            )
+            if search_decision is not None:
+                return search_decision
         if issues:
             return ActionIntentDecision(
                 should_act=False,
@@ -1314,6 +1338,22 @@ def _browser_open_gate_has_target_metadata(gate: ActionIntentGate) -> bool:
         return True
     reason = gate.reason.casefold() if isinstance(gate.reason, str) else ""
     return any(token in reason for token in ("query", "url", "target", "page", "search"))
+
+
+def _gate_template_missing_search_query(
+    gate: ActionIntentGate,
+    issues: list[ClientActionValidationIssue],
+) -> bool:
+    if template_key_for_gate(gate) not in {
+        "browser_search",
+        "browser_search_open_first",
+        "web_search",
+    }:
+        return False
+    return any(
+        issue.code == "missing_template_slot" and issue.field == "slots.query"
+        for issue in issues
+    )
 
 
 def _missing_ordered_action_names(

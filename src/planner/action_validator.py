@@ -435,6 +435,30 @@ def _required_v2_args(
                     field="args.query",
                 )
             )
+    elif action.name == "todo.create":
+        title = args.get("title") or action.target or action.payload
+        if not isinstance(title, str) or not title.strip():
+            issues.append(
+                _issue(
+                    "missing_required_field",
+                    "todo.create requires title",
+                    action_index=index,
+                    action_name=action.name,
+                    field="args.title",
+                )
+            )
+    elif action.name in {"todo.update", "todo.delete"}:
+        todo_id = args.get("todo_id") or action.target or action.payload
+        if not isinstance(todo_id, str) or not todo_id.strip():
+            issues.append(
+                _issue(
+                    "missing_required_field",
+                    f"{action.name} requires todo_id",
+                    action_index=index,
+                    action_name=action.name,
+                    field="args.todo_id",
+                )
+            )
     elif action.name == "calendar.create":
         for field in ("title", "start", "end"):
             require_string(field)
@@ -487,6 +511,7 @@ def _capability_candidates(name: str) -> tuple[str, ...]:
         "file": ("file_read", "file_write"),
         "web_search": ("web_search",),
         "calendar": ("calendar_control", "calendar"),
+        "todo": ("todo",),
     }
     return (name, namespace, *legacy.get(namespace, ()))
 
@@ -512,6 +537,7 @@ def _v1_capability_candidates(
         "file_write": ("file", "file.write", "file_write"),
         "web_search": ("web_search",),
         "calendar_control": ("calendar", "calendar_control"),
+        "todo": ("todo", f"todo.{command}"),
     }
     return mapped.get(action_type, (action_type,))
 

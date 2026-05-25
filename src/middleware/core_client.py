@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Generator
 from dataclasses import dataclass, field
@@ -22,6 +23,20 @@ class CoreResponse:
     summary: str
     content: str
     next_actions: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class CoreBinaryResponse:
+    content: bytes
+    media_type: str
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class CoreStreamResponse:
+    body: Generator[bytes, None, None]
+    media_type: str
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 class CoreClient:
@@ -267,6 +282,148 @@ class CoreClient:
         )
         return result if isinstance(result, list) else []
 
+    # ── audio ───────────────────────────────────────────────
+
+    def synthesize_speech(
+        self,
+        *,
+        user_id: str,
+        body: dict[str, object],
+        request_id: str = "",
+    ) -> CoreBinaryResponse:
+        raw_body = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            url=f"{self.base_url}{JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH.path}",
+            data=raw_body,
+            headers={
+                "accept": "*/*",
+                "content-type": "application/json",
+                "x-user-id": user_id,
+                "x-request-id": request_id,
+            },
+            method=JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH.method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                content = response.read()
+                media_type = response.headers.get("content-type", "audio/mpeg").split(
+                    ";", 1
+                )[0]
+                headers = {
+                    name: response.headers[name]
+                    for name in (
+                        "x-tts-provider",
+                        "x-tts-model",
+                        "x-tts-voice",
+                        "x-tts-format",
+                        "x-ai-generated-voice",
+                    )
+                    if name in response.headers
+                }
+                return CoreBinaryResponse(
+                    content=content,
+                    media_type=media_type,
+                    headers=headers,
+                )
+        except urllib.error.HTTPError as exc:
+            detail = self._decode_error_payload(exc)
+            raise HTTPException(status_code=exc.code, detail=detail) from exc
+        except urllib.error.URLError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="core unavailable",
+            ) from exc
+
+    def synthesize_speech_pcm_stream(
+        self,
+        *,
+        user_id: str,
+        body: dict[str, object],
+        request_id: str = "",
+    ) -> CoreStreamResponse:
+        raw_body = json.dumps(body).encode("utf-8")
+        request = urllib.request.Request(
+            url=f"{self.base_url}{JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_PCM.path}",
+            data=raw_body,
+            headers={
+                "accept": "audio/pcm",
+                "content-type": "application/json",
+                "x-user-id": user_id,
+                "x-request-id": request_id,
+            },
+            method=JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_PCM.method,
+        )
+        try:
+            response = urllib.request.urlopen(request, timeout=60)
+        except urllib.error.HTTPError as exc:
+            detail = self._decode_error_payload(exc)
+            raise HTTPException(status_code=exc.code, detail=detail) from exc
+        except urllib.error.URLError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="core unavailable",
+            ) from exc
+
+        media_type = response.headers.get("content-type", "audio/pcm").split(";", 1)[0]
+        headers = {
+            name: response.headers[name]
+            for name in (
+                "x-tts-provider",
+                "x-tts-model",
+                "x-tts-voice",
+                "x-tts-format",
+                "x-tts-sample-rate",
+                "x-tts-channels",
+                "x-tts-sample-width",
+                "x-tts-chunk-count",
+                "x-ai-generated-voice",
+            )
+            if name in response.headers
+        }
+
+        def stream_body() -> Generator[bytes, None, None]:
+            try:
+                while True:
+                    chunk = response.read(8192)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                response.close()
+
+        return CoreStreamResponse(
+            body=stream_body(),
+            media_type=media_type,
+            headers=headers,
+        )
+
+    def list_speech_models(
+        self,
+        *,
+        user_id: str,
+        request_id: str = "",
+    ) -> dict[str, object]:
+        request = urllib.request.Request(
+            url=f"{self.base_url}{JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_MODELS.path}",
+            headers={
+                "accept": "application/json",
+                "x-user-id": user_id,
+                "x-request-id": request_id,
+            },
+            method=JarvisCoreEndpoints.INTERNAL_AUDIO_SPEECH_MODELS.method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = self._decode_error_payload(exc)
+            raise HTTPException(status_code=exc.code, detail=detail) from exc
+        except urllib.error.URLError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="core unavailable",
+            ) from exc
+
     def set_runtime_profile(
         self, *, user_id: str, body: dict[str, object]
     ) -> dict[str, object]:
@@ -282,6 +439,73 @@ class CoreClient:
         result = self._request_json(
             JarvisCoreEndpoints.INTERNAL_CLIENT_RUNTIME_PROFILE_GET.method,
             JarvisCoreEndpoints.INTERNAL_CLIENT_RUNTIME_PROFILE_GET.path,
+            body=None,
+            extra_headers={"x-user-id": user_id},
+        )
+        return result if isinstance(result, dict) else {}
+
+    # ── todos ──────────────────────────────────────────────
+
+    def create_todo(self, *, user_id: str, body: dict[str, object]) -> dict[str, object]:
+        result = self._request_json(
+            JarvisCoreEndpoints.INTERNAL_TODOS.method,
+            JarvisCoreEndpoints.INTERNAL_TODOS.path,
+            body=body,
+            extra_headers={"x-user-id": user_id},
+        )
+        return result if isinstance(result, dict) else {}
+
+    def list_todos(
+        self,
+        *,
+        user_id: str,
+        status: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 50,
+    ) -> dict[str, object]:
+        query = urllib.parse.urlencode(
+            {
+                "include_deleted": str(include_deleted).lower(),
+                "limit": limit,
+                **({"status": status} if status else {}),
+            }
+        )
+        result = self._request_json(
+            JarvisCoreEndpoints.INTERNAL_TODOS_LIST.method,
+            f"{JarvisCoreEndpoints.INTERNAL_TODOS_LIST.path}?{query}",
+            body=None,
+            extra_headers={"x-user-id": user_id},
+        )
+        return result if isinstance(result, dict) else {"items": []}
+
+    def get_todo(self, *, user_id: str, todo_id: str) -> dict[str, object]:
+        result = self._request_json(
+            JarvisCoreEndpoints.INTERNAL_TODO_DETAIL.method,
+            JarvisCoreEndpoints.INTERNAL_TODO_DETAIL.path.format(todo_id=todo_id),
+            body=None,
+            extra_headers={"x-user-id": user_id},
+        )
+        return result if isinstance(result, dict) else {}
+
+    def update_todo(
+        self,
+        *,
+        user_id: str,
+        todo_id: str,
+        body: dict[str, object],
+    ) -> dict[str, object]:
+        result = self._request_json(
+            JarvisCoreEndpoints.INTERNAL_TODO_UPDATE.method,
+            JarvisCoreEndpoints.INTERNAL_TODO_UPDATE.path.format(todo_id=todo_id),
+            body=body,
+            extra_headers={"x-user-id": user_id},
+        )
+        return result if isinstance(result, dict) else {}
+
+    def delete_todo(self, *, user_id: str, todo_id: str) -> dict[str, object]:
+        result = self._request_json(
+            JarvisCoreEndpoints.INTERNAL_TODO_DELETE.method,
+            JarvisCoreEndpoints.INTERNAL_TODO_DELETE.path.format(todo_id=todo_id),
             body=None,
             extra_headers={"x-user-id": user_id},
         )

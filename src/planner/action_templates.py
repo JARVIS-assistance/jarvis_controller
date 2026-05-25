@@ -24,9 +24,22 @@ _SEARCH_QUERY_PREFIX_PATTERNS = (
         r"(?:open|launch)(?:\s+the)?)?\s*(?:에서|로)?\s*",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"^\s*(?:구글|google|네이버|naver)\s*(?:에서|로)\s*",
+        re.IGNORECASE,
+    ),
 )
 
 _SEARCH_QUERY_SUFFIX_PATTERNS = (
+    re.compile(
+        r"\s*(?:브라우저|크롬|chrome|browser)\s*(?:를|을|에서|로)?\s*"
+        r"(?:(?:열어서|열어|열고|켜서|켜고|실행해서|실행하고)|"
+        r"(?:open|launch)(?:\s+the)?)?\s*(?:에서|로)?\s*"
+        r"(?:검색(?:해줘|해 줘|해봐|해 봐|해줄래|해 줄래|해)?|"
+        r"찾아(?:줘| 줘|봐| 봐|줄래| 줄래)?|search(?:\s+for)?|find|look\s+up|lookup)"
+        r"\s*[.!?。]*$",
+        re.IGNORECASE,
+    ),
     re.compile(
         r"\s*(?:을|를)?\s*(?:검색(?:해줘|해 줘|해봐|해 봐|해줄래|해 줄래|해)?|"
         r"찾아(?:줘| 줘|봐| 봐|줄래| 줄래)?|search(?:\s+for)?|find|look\s+up|lookup)"
@@ -36,6 +49,13 @@ _SEARCH_QUERY_SUFFIX_PATTERNS = (
     re.compile(
         r"\s*(?:페이지|사이트)?\s*(?:열어(?:줘| 줘|볼래| 볼래)?|"
         r"들어가(?:줘| 줘|볼래| 볼래)?|open|go\s+to)\s*[.!?。]*$",
+        re.IGNORECASE,
+    ),
+)
+
+_SEARCH_TOPIC_TRAILING_RELATION_PATTERNS = (
+    re.compile(
+        r"\s*(?:에|애)?\s*(?:대해(?:서)?|대한|관해(?:서)?|관한|관련(?:해서)?)$",
         re.IGNORECASE,
     ),
 )
@@ -72,6 +92,8 @@ def normalize_browser_search_query(text: str) -> str:
     for pattern in _SEARCH_QUERY_PREFIX_PATTERNS:
         query = pattern.sub("", query).strip()
     for pattern in _SEARCH_QUERY_SUFFIX_PATTERNS:
+        query = pattern.sub("", query).strip()
+    for pattern in _SEARCH_TOPIC_TRAILING_RELATION_PATTERNS:
         query = pattern.sub("", query).strip()
     query = re.sub(r"\s+", " ", query).strip(" \t\r\n,，.。!?")
     return query or original
@@ -687,10 +709,10 @@ def materialize_fresh_context_app_open_for_text(
     reason: str,
 ) -> TemplateMaterialization:
     """Open a local app when fresh-context text matches runtime app metadata."""
-    if not _is_fresh_action_context(context):
-        return TemplateMaterialization()
     query = text.strip()
     if not query:
+        return TemplateMaterialization()
+    if not _can_open_matching_app_for_context(query, context):
         return TemplateMaterialization()
     app_name = _matching_application_for_text(query, context)
     if app_name is None:
@@ -813,15 +835,25 @@ def materialize_browser_search_for_text(
         return TemplateMaterialization()
     if not _looks_like_browser_search_request(query):
         return TemplateMaterialization()
+    normalized_query = normalize_browser_search_query(query)
+    if _is_vague_search_query(query, normalized_query):
+        return TemplateMaterialization()
 
-    payload = json.loads(
-        json.dumps(fast_action_templates()["browser_search"], ensure_ascii=False)
+    template_key = (
+        "browser_search_open_first"
+        if _looks_like_search_open_first_request(query)
+        and _context_supports_action(context, "browser.select_result")
+        else "browser_search"
     )
+    payload = json.loads(json.dumps(fast_action_templates()[template_key], ensure_ascii=False))
     payload["goal"] = "Search browser"
     payload["confidence"] = max(float(payload.get("confidence") or 0), confidence)
     payload["reason"] = reason
-    payload["actions"][0]["args"]["query"] = normalize_browser_search_query(query)
+    payload["actions"][0]["args"]["query"] = normalized_query
     payload["actions"][0]["description"] = "Search browser"
+    if template_key == "browser_search_open_first":
+        payload["goal"] = "Search and open first result"
+        payload["actions"][1]["args"]["index"] = 1
     try:
         return TemplateMaterialization(plan=ClientActionPlan.model_validate(payload))
     except ValidationError as exc:
@@ -1008,6 +1040,15 @@ def _is_fresh_action_context(context: dict[str, Any] | None) -> bool:
     return context.get("browser_active") is not True
 
 
+def _can_open_matching_app_for_context(
+    text: str,
+    context: dict[str, Any] | None,
+) -> bool:
+    if _is_fresh_action_context(context):
+        return True
+    return not _text_matches_active_application(text, context)
+
+
 def _matching_application_for_text(
     text: str,
     context: dict[str, Any] | None,
@@ -1021,7 +1062,7 @@ def _matching_application_for_text(
     for item in raw:
         if isinstance(item, str):
             app_name = item.strip()
-            candidates = [app_name]
+            candidates = [app_name, *_local_app_aliases_for_name(app_name)]
         elif isinstance(item, dict):
             name = item.get("name")
             if not isinstance(name, str) or not name.strip():
@@ -1225,6 +1266,18 @@ def _local_app_aliases_for_item(item: dict[str, Any]) -> list[str]:
     return []
 
 
+def _local_app_aliases_for_name(app_name: str) -> list[str]:
+    identity_key = _application_match_key(app_name)
+    if not identity_key:
+        return []
+    for bundle_id, aliases in _LOCAL_APP_ALIAS_PROFILE.items():
+        bundle_key = _application_match_key(bundle_id)
+        alias_keys = {_application_match_key(alias) for alias in aliases}
+        if identity_key == bundle_key or identity_key in alias_keys:
+            return list(aliases)
+    return []
+
+
 def _context_supports_action(
     context: dict[str, Any] | None,
     action_name: str,
@@ -1287,6 +1340,46 @@ def _looks_like_browser_search_request(text: str) -> bool:
     if any(term in lowered for term in search_terms):
         return True
     return any(term in compact for term in ("찾아줘", "찾아봐", "찾아줄래"))
+
+
+def _is_vague_search_query(original: str, normalized_query: str) -> bool:
+    compact_original = _application_match_key(original)
+    compact_query = _application_match_key(normalized_query)
+    vague_terms = {
+        "",
+        "검색",
+        "검색해",
+        "검색해서",
+        "검색하고",
+        "검색후",
+        "검색해줘",
+        "검색해봐",
+        "검색해줄래",
+        "찾아",
+        "찾아줘",
+        "찾아봐",
+        "찾아줄래",
+        "서치",
+        "search",
+        "find",
+        "lookup",
+        "lookup해줘",
+    }
+    browser_vague_terms = {
+        "브라우저에서검색해줘",
+        "브라우저로검색해줘",
+        "크롬에서검색해줘",
+        "크롬으로검색해줘",
+        "구글에서검색해줘",
+        "구글로검색해줘",
+        "네이버에서검색해줘",
+        "네이버로검색해줘",
+        "브라우저에서찾아줘",
+        "브라우저로찾아줘",
+        "크롬에서찾아줘",
+        "크롬으로찾아줘",
+    }
+    return compact_query in vague_terms or compact_original in browser_vague_terms
 
 
 def _looks_like_search_open_first_request(text: str) -> bool:

@@ -8,6 +8,9 @@ from middleware.core_client import CoreClient
 from middleware.gateway_client import GatewayClient
 from planner.action_context import ActionContextStore
 from planner.action_dispatcher import ActionDispatcher
+from planner.ollama_preload import start_ollama_preload_thread
+from planner.server_actions import execute_server_action
+from planner.turn_cancellation import TurnCancellationStore
 from router.router import _action_runtime_config_payload, api_router
 
 logging.basicConfig(level=logging.INFO)
@@ -112,7 +115,18 @@ def create_app(
     app.state.core_client = core_client or CoreClient()
     app.state.action_dispatcher = ActionDispatcher()
     app.state.action_context = ActionContextStore()
+    app.state.turn_cancellation = TurnCancellationStore()
     app.state.action_dispatcher.context_store = app.state.action_context
+    app.state.action_dispatcher.server_action_handler = (
+        lambda user_id, request_id, action_id, action: execute_server_action(
+            core_client=app.state.core_client,
+            user_id=user_id,
+            request_id=request_id,
+            action_id=action_id,
+            action=action,
+        )
+    )
+    app.state.ollama_preload_thread = start_ollama_preload_thread()
     app.add_middleware(GatewayAuthMiddleware, gateway_client=app.state.gateway_client)
     app.include_router(api_router)
     logger.info("action runtime config=%s", _action_runtime_config_payload())

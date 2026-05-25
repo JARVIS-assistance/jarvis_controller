@@ -6,6 +6,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from typing import Callable
 
 from jarvis_contracts import (
     ClientAction,
@@ -13,6 +14,11 @@ from jarvis_contracts import (
     ClientActionResult,
     ClientActionResultRequest,
 )
+
+ServerActionHandler = Callable[
+    [str, str, str, ClientAction],
+    ClientActionResult | None,
+]
 
 
 def _default_timeout_seconds() -> float:
@@ -44,6 +50,7 @@ class ActionDispatcher:
             else timeout_seconds
         )
         self.context_store = None
+        self.server_action_handler: ServerActionHandler | None = None
         self._condition = threading.Condition()
         self._queues: dict[str, deque[str]] = defaultdict(deque)
         self._records: dict[str, _ActionRecord] = {}
@@ -61,12 +68,20 @@ class ActionDispatcher:
             request_id=request_id,
             action=action,
         )
+        server_result = self._execute_server_action(
+            user_id=user_id,
+            request_id=request_id,
+            action_id=action_id,
+            action=action,
+        )
         with self._condition:
             self._records[action_id] = _ActionRecord(
                 user_id=user_id,
                 envelope=envelope,
+                result=server_result,
             )
-            self._queues[user_id].append(action_id)
+            if server_result is None:
+                self._queues[user_id].append(action_id)
             self._condition.notify_all()
         return envelope
 
@@ -111,6 +126,42 @@ class ActionDispatcher:
             self._condition.notify_all()
             return result
 
+    def cancel_request(
+        self,
+        *,
+        user_id: str,
+        request_id: str,
+        reason: str,
+    ) -> int:
+        cancelled = 0
+        with self._condition:
+            for record in self._records.values():
+                if record.user_id != user_id:
+                    continue
+                if record.envelope.request_id != request_id:
+                    continue
+                if record.result is not None:
+                    continue
+                record.result = ClientActionResult(
+                    action_id=record.envelope.action_id,
+                    request_id=request_id,
+                    status="rejected",
+                    output={"cancelled": True, "reason": reason},
+                    error=f"cancelled: {reason}",
+                )
+                cancelled += 1
+            if cancelled:
+                self._queues[user_id] = deque(
+                    action_id
+                    for action_id in self._queues[user_id]
+                    if not (
+                        (record := self._records.get(action_id))
+                        and record.envelope.request_id == request_id
+                    )
+                )
+                self._condition.notify_all()
+        return cancelled
+
     def dispatch_and_wait(
         self,
         *,
@@ -153,3 +204,36 @@ class ActionDispatcher:
                         record.result = result
                     return result
                 self._condition.wait(timeout=remaining)
+
+    def result_if_ready(
+        self,
+        *,
+        action_id: str,
+        request_id: str,
+    ) -> ClientActionResult | None:
+        with self._condition:
+            record = self._records.get(action_id)
+            if record is None or record.envelope.request_id != request_id:
+                return None
+            return record.result
+
+    def _execute_server_action(
+        self,
+        *,
+        user_id: str,
+        request_id: str,
+        action_id: str,
+        action: ClientAction,
+    ) -> ClientActionResult | None:
+        if self.server_action_handler is None:
+            return None
+        try:
+            return self.server_action_handler(user_id, request_id, action_id, action)
+        except Exception as exc:
+            return ClientActionResult(
+                action_id=action_id,
+                request_id=request_id,
+                status="failed",
+                error=str(exc),
+                output={"source": "server_action"},
+            )

@@ -53,10 +53,22 @@ ANALYSIS_KEYWORDS = {
     "최적화",
     "비교",
     "아키텍처",
+    "구조",
+    "충돌",
+    "우선순위",
+    "백엔드",
+    "프론트",
+    "프론트엔드",
+    "연동",
+    "api",
+    "db",
     "strategy",
     "debug",
     "analysis",
     "design",
+    "architecture",
+    "backend",
+    "frontend",
     "refactor",
     "optimize",
     "compare",
@@ -175,6 +187,14 @@ def evaluate_conversation_mode(
             reasons=["explicit planning request"],
         )
 
+    if _looks_like_code_output_request(normalized):
+        return RoutingDecision(
+            mode=ConversationMode.DEEP,
+            triggered=True,
+            confidence=0.9,
+            reasons=["code generation request"],
+        )
+
     if _looks_like_fast_realtime(normalized, message):
         return RoutingDecision(
             mode=ConversationMode.REALTIME,
@@ -273,6 +293,46 @@ def _looks_like_log_or_traceback(message: str) -> bool:
     tokens = ("traceback", "exception", "error:", "stack trace", "stderr", "stdout")
     lowered = message.lower()
     return any(token in lowered for token in tokens)
+
+
+def _looks_like_code_output_request(message: str) -> bool:
+    code_terms = (
+        "코드",
+        "소스",
+        "함수",
+        "클래스",
+        "스크립트",
+        "프로그램",
+        "구현",
+        "code",
+        "source",
+        "function",
+        "class",
+        "script",
+        "program",
+        "implementation",
+    )
+    output_terms = (
+        "작성",
+        "짜",
+        "만들",
+        "제공",
+        "보여",
+        "예시",
+        "구현",
+        "생성",
+        "write",
+        "make",
+        "create",
+        "provide",
+        "show",
+        "example",
+        "generate",
+        "implement",
+    )
+    return any(term in message for term in code_terms) and any(
+        term in message for term in output_terms
+    )
 
 
 def _has_multistep_structure(message: str) -> bool:
