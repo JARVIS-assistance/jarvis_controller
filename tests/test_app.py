@@ -1437,6 +1437,22 @@ def test_client_action_pending_and_result_endpoints() -> None:
     assert result["output"]["scroll_y"] == 1200
 
 
+def test_deepthink_watch_streams_and_stops_when_stub_returns_no_actions() -> None:
+    response = client.post(
+        "/deepthink/watch",
+        json={"goal": "keep clicking until done", "max_iterations": 3},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "event: autonomous_start" in body
+    assert "event: autonomous_iteration" in body
+    assert "event: autonomous_done" in body
+    assert '"stop_reason": "no_further_actions"' in body
+    assert '"iterations": 1' in body
+
+
 def test_vision_frame_push_and_fetch_roundtrip() -> None:
     missing = client.get("/client/vision/frame", headers=auth_headers())
     assert missing.status_code == 404

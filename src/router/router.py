@@ -64,6 +64,11 @@ from planner.action_templates import (
     materialize_fresh_context_app_open_for_text,
     normalize_browser_search_query,
 )
+from planner.autonomous_loop import (
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_MAX_SECONDS,
+    stream_autonomous_loop,
+)
 from planner.conversation_orchestrator import orchestrate_conversation_turn
 from planner.conversation_routing import (
     ConversationContext,
@@ -401,6 +406,12 @@ class RuntimeProfileRequest(BaseModel):
     applications: list[RuntimeApplicationRequest] = Field(default_factory=list)
     terminal: TerminalProfileRequest | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class AutonomousLoopRequest(BaseModel):
+    goal: str = Field(min_length=1, max_length=2000)
+    max_iterations: int = Field(default=DEFAULT_MAX_ITERATIONS, ge=1, le=25)
+    max_seconds: float = Field(default=DEFAULT_MAX_SECONDS, ge=5.0, le=1800.0)
 
 
 class VisionFramePushRequest(BaseModel):
@@ -5111,6 +5122,65 @@ def _vision_frame_cache(request: Request) -> dict[str, dict[str, object]]:
         return cache
     request.app.state.vision_frames = {}
     return request.app.state.vision_frames
+
+
+@api_router.post(
+    "/deepthink/watch",
+    tags=["execution"],
+    summary="Run a bounded observe-act loop toward an open-ended goal",
+)
+def deepthink_watch(
+    body: AutonomousLoopRequest,
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+) -> StreamingResponse:
+    _ = authorization_header
+    principal = request.state.principal
+    request_id = request.headers.get("x-request-id") or f"req_{uuid4().hex}"
+    turn_store = _turn_cancellation_store(request)
+    previous_request_id = turn_store.begin_turn(
+        user_id=principal.user_id,
+        request_id=request_id,
+        reason="autonomous_loop_started",
+    )
+    _cancel_pending_actions_for_turn(
+        request=request,
+        user_id=principal.user_id,
+        request_id=previous_request_id,
+        reason="autonomous_loop_started",
+    )
+
+    def is_cancelled() -> bool:
+        return (
+            turn_store.cancellation(user_id=principal.user_id, request_id=request_id)
+            is not None
+        )
+
+    def stream() -> Generator[bytes, None, None]:
+        try:
+            yield from stream_autonomous_loop(
+                core_client=request.app.state.core_client,
+                action_dispatcher=request.app.state.action_dispatcher,
+                request_id=request_id,
+                user_id=principal.user_id,
+                goal=body.goal,
+                max_iterations=body.max_iterations,
+                max_seconds=body.max_seconds,
+                is_cancelled=is_cancelled,
+            )
+        finally:
+            turn_store.finish_turn(user_id=principal.user_id, request_id=request_id)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @api_router.post("/execute", tags=["execution"], summary="Execute action")
