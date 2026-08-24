@@ -15,6 +15,8 @@ from jarvis_contracts import (
 RISKY_V2_ACTIONS = {
     "terminal.run",
     "file.write",
+    "file.move",
+    "file.delete",
     "mouse.click",
     "mouse.drag",
     "clipboard.paste",
@@ -28,6 +30,8 @@ RISKY_V1_ACTIONS = {
     ("calendar_control", "create_event"),
     ("calendar_control", "update_event"),
     ("calendar_control", "delete_event"),
+    ("file_manage", "move"),
+    ("file_manage", "delete"),
 }
 
 ABSTRACT_APP_TARGETS = {
@@ -361,6 +365,28 @@ def _required_v2_args(
                     field="args.text",
                 )
             )
+    elif action.name == "file.search":
+        require_string("query")
+    elif action.name == "file.move":
+        require_string("destination")
+    elif action.name == "keyboard.press":
+        require_string("key")
+    elif action.name == "mouse.position":
+        pass
+    elif action.name in {"file.list", "file.mkdir", "file.delete", "system.info", "process.list", "application.list", "app.active", "screen.size"}:
+        pass
+    elif action.name == "screen.pixel":
+        for field in ("x", "y"):
+            if not isinstance(args.get(field), int):
+                issues.append(
+                    _issue(
+                        "missing_required_field",
+                        f"screen.pixel requires {field}",
+                        action_index=index,
+                        action_name=action.name,
+                        field=f"args.{field}",
+                    )
+                )
     elif action.name == "keyboard.type":
         text = args.get("text") or action.payload
         if not isinstance(text, str) or not text:
@@ -526,16 +552,17 @@ def _capability_candidates(name: str) -> tuple[str, ...]:
     legacy = {
         "browser": ("browser_control", "open_url"),
         "app": ("app_control",),
-        "keyboard": ("keyboard_type", "hotkey"),
+        "keyboard": ("keyboard_type", "hotkey", "key_press"),
         "mouse": ("mouse_click", "mouse_drag", "mouse_move", "mouse_scroll"),
         "screen": ("screenshot", "screen_stream"),
         "clipboard": ("clipboard",),
         "terminal": ("terminal",),
         "notification": ("notify", "notification"),
-        "file": ("file_read", "file_write"),
+        "file": ("file_read", "file_write", "file_manage"),
         "web_search": ("web_search",),
         "calendar": ("calendar_control", "calendar"),
         "todo": ("todo",),
+        "system": ("system_info",),
     }
     return (name, namespace, *legacy.get(namespace, ()))
 
@@ -553,7 +580,11 @@ def _v1_capability_candidates(
         "hotkey": ("keyboard", "keyboard.hotkey", "hotkey"),
         "mouse_click": ("mouse", "mouse.click", "mouse_click"),
         "mouse_drag": ("mouse", "mouse.drag", "mouse_drag"),
-        "mouse_move": ("mouse", "mouse.move", "mouse_move"),
+        "mouse_move": (
+            "mouse",
+            "mouse.position" if command == "position" else "mouse.move",
+            "mouse_move",
+        ),
         "mouse_scroll": ("mouse", "mouse.scroll", "mouse_scroll"),
         "screenshot": ("screen", "screen.screenshot", "screenshot"),
         "screen_stream": (
@@ -564,8 +595,23 @@ def _v1_capability_candidates(
         "clipboard": ("clipboard", f"clipboard.{command}", "clipboard"),
         "terminal": ("terminal", "terminal.run", "terminal"),
         "notify": ("notification", "notification.show", "notify"),
-        "file_read": ("file", "file.read", "file_read"),
+        "file_read": (
+            "file",
+            {"list": "file.list", "search": "file.search"}.get(command or "", "file.read"),
+            "file_read",
+        ),
         "file_write": ("file", "file.write", "file_write"),
+        "file_manage": ("file", f"file.{command}" if command else "file_manage", "file_manage"),
+        "system_info": (
+            "system",
+            {
+                "processes": "process.list",
+                "applications": "application.list",
+                "active_app": "app.active",
+            }.get(command or "", "system.info"),
+            "system_info",
+        ),
+        "key_press": ("keyboard", "keyboard.press", "key_press"),
         "web_search": ("web_search",),
         "calendar_control": ("calendar", "calendar_control"),
         "todo": ("todo", f"todo.{command}"),

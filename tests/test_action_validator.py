@@ -219,6 +219,124 @@ def test_validator_forces_confirmation_for_risky_actions() -> None:
     assert result.plan.actions[0].requires_confirm is True
 
 
+def test_validator_accepts_v2_mouse_position_with_no_required_args() -> None:
+    plan = ClientActionPlan(
+        mode="direct",
+        actions=[
+            ClientActionV2(
+                name="mouse.position",
+                description="where is the cursor",
+                requires_confirm=False,
+            )
+        ],
+    )
+
+    result = ActionValidator().validate_plan(
+        plan, context={"capabilities": [{"name": "mouse.position", "enabled": True}]}
+    )
+
+    assert result.valid is True
+
+
+def test_validator_rejects_file_move_without_destination() -> None:
+    plan = ClientActionPlan(
+        mode="direct",
+        actions=[
+            ClientActionV2(
+                name="file.move",
+                target="/allowed/a.txt",
+                description="rename file",
+                requires_confirm=False,
+            )
+        ],
+    )
+
+    result = ActionValidator().validate_plan(
+        plan, context={"capabilities": [{"name": "file.move", "enabled": True}]}
+    )
+
+    assert result.valid is False
+    assert result.issues[0].code == "missing_required_field"
+    assert result.issues[0].field == "args.destination"
+
+
+def test_validator_forces_confirm_on_file_move_and_delete() -> None:
+    plan = ClientActionPlan(
+        mode="direct",
+        actions=[
+            ClientActionV2(
+                name="file.delete",
+                target="/allowed/old.txt",
+                description="delete file",
+                requires_confirm=False,
+            )
+        ],
+    )
+
+    result = ActionValidator().validate_plan(
+        plan, context={"capabilities": [{"name": "file.delete", "enabled": True}]}
+    )
+
+    assert result.valid is True
+    assert result.plan.actions[0].requires_confirm is True
+
+
+def test_validator_rejects_keyboard_press_without_key() -> None:
+    plan = ClientActionPlan(
+        mode="direct",
+        actions=[
+            ClientActionV2(
+                name="keyboard.press",
+                description="press a key",
+                requires_confirm=False,
+            )
+        ],
+    )
+
+    result = ActionValidator().validate_plan(
+        plan, context={"capabilities": [{"name": "keyboard.press", "enabled": True}]}
+    )
+
+    assert result.valid is False
+    assert result.issues[0].field == "args.key"
+
+
+def test_validator_maps_v1_file_manage_move_to_risky_and_capability() -> None:
+    action = ClientAction(
+        type="file_manage",
+        command="move",
+        target="/allowed/a.txt",
+        args={"destination": "/allowed/b.txt"},
+        description="rename",
+        requires_confirm=False,
+    )
+
+    result = ActionValidator().validate_v1_actions(
+        [action],
+        context={"capabilities": [{"name": "file.move", "enabled": True}]},
+    )
+
+    assert result.valid is True
+    assert result.actions[0].requires_confirm is True
+
+
+def test_validator_maps_v1_system_info_processes_command_to_capability() -> None:
+    action = ClientAction(
+        type="system_info",
+        command="processes",
+        args={},
+        description="list processes",
+        requires_confirm=False,
+    )
+
+    result = ActionValidator().validate_v1_actions(
+        [action],
+        context={"capabilities": [{"name": "process.list", "enabled": True}]},
+    )
+
+    assert result.valid is True
+
+
 def test_validator_does_not_rewrite_natural_language_into_actions() -> None:
     plan = ClientActionPlan(
         mode="direct",
