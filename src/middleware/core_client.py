@@ -511,6 +511,27 @@ class CoreClient:
         )
         return result if isinstance(result, dict) else {}
 
+    # ── vision ────────────────────────────────────────────
+
+    def describe_vision_frame(
+        self,
+        *,
+        user_id: str,
+        image_base64: str,
+        prompt: str | None = None,
+    ) -> dict[str, object]:
+        body: dict[str, object] = {"image_base64": image_base64}
+        if prompt:
+            body["prompt"] = prompt
+        result = self._request_json(
+            JarvisCoreEndpoints.INTERNAL_VISION_DESCRIBE.method,
+            JarvisCoreEndpoints.INTERNAL_VISION_DESCRIBE.path,
+            body=body,
+            extra_headers={"x-user-id": user_id},
+            timeout_seconds=self.deepthink_timeout_seconds,
+        )
+        return result if isinstance(result, dict) else {}
+
     # ── deepthink ───────────────────────────────────────────
 
     def deepthink_plan(

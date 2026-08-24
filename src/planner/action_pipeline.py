@@ -168,18 +168,85 @@ def _todo_list_completion_content(
     if not items:
         return "남은 할 일이 없습니다."
     lines = ["남은 할 일입니다."]
+    default_timezone = _todo_list_timezone(result, action_args)
     for index, item in enumerate(items[:20], start=1):
         if not isinstance(item, dict):
             continue
         title = item.get("title")
         if not isinstance(title, str) or not title.strip():
             title = str(item.get("id") or f"할 일 {index}")
-        due_at = item.get("due_at")
-        suffix = f" - {due_at}" if isinstance(due_at, str) and due_at.strip() else ""
+        suffix = _todo_due_at_suffix(item, default_timezone=default_timezone)
         lines.append(f"{index}. {title}{suffix}")
     if len(items) > 20:
         lines.append(f"외 {len(items) - 20}개가 더 있습니다.")
     return "\n".join(lines)
+
+
+def _todo_due_at_suffix(
+    item: dict[str, object],
+    *,
+    default_timezone: ZoneInfo,
+) -> str:
+    due_at = item.get("due_at")
+    if not isinstance(due_at, str) or not due_at.strip():
+        return ""
+    timezone = _todo_item_timezone(item, default_timezone=default_timezone)
+    formatted = _format_todo_due_at(due_at, timezone=timezone)
+    return f" - {formatted or due_at.strip()}"
+
+
+def _format_todo_due_at(value: str, *, timezone: ZoneInfo) -> str | None:
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone)
+    local = parsed.astimezone(timezone)
+    today = datetime.now(timezone).date()
+    if local.date() == today:
+        return f"오늘 {local:%H:%M}"
+    if local.date() == today + timedelta(days=1):
+        return f"내일 {local:%H:%M}"
+    if local.date() == today - timedelta(days=1):
+        return f"어제 {local:%H:%M}"
+    if local.year == today.year:
+        return f"{local.month}월 {local.day}일 {local:%H:%M}"
+    return f"{local:%Y-%m-%d %H:%M}"
+
+
+def _todo_list_timezone(
+    result: dict[str, object],
+    action_args: object,
+) -> ZoneInfo:
+    timezone = _zoneinfo_from_value(result.get("timezone"))
+    if timezone is not None:
+        return timezone
+    if isinstance(action_args, dict):
+        timezone = _zoneinfo_from_value(action_args.get("timezone"))
+        if timezone is not None:
+            return timezone
+    return ZoneInfo("Asia/Seoul")
+
+
+def _todo_item_timezone(
+    item: dict[str, object],
+    *,
+    default_timezone: ZoneInfo,
+) -> ZoneInfo:
+    return _zoneinfo_from_value(item.get("timezone")) or default_timezone
+
+
+def _zoneinfo_from_value(value: object) -> ZoneInfo | None:
+    if isinstance(value, str) and value.strip():
+        try:
+            return ZoneInfo(value.strip())
+        except Exception:
+            return None
+    return None
 
 
 def _todo_free_time_completion_content(
@@ -228,11 +295,9 @@ def _todo_busy_interval(
         return None
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone)
-    end = end.astimezone(timezone)
+    start = end.astimezone(timezone)
     duration_minutes = _duration_minutes(item)
-    start = end.replace(minute=0, second=0, microsecond=0)
-    if duration_minutes > 0:
-        start = end - timedelta(minutes=duration_minutes)
+    end = start + timedelta(minutes=duration_minutes)
     return start, end
 
 

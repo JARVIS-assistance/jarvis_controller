@@ -1437,6 +1437,40 @@ def test_client_action_pending_and_result_endpoints() -> None:
     assert result["output"]["scroll_y"] == 1200
 
 
+def test_vision_frame_push_and_fetch_roundtrip() -> None:
+    missing = client.get("/client/vision/frame", headers=auth_headers())
+    assert missing.status_code == 404
+
+    pushed = client.post(
+        "/client/vision/frame",
+        json={
+            "frame_base64": "ZmFrZS1qcGVn",
+            "mime_type": "image/jpeg",
+            "sequence": 1,
+            "width": 1280,
+            "height": 720,
+        },
+        headers=auth_headers(),
+    )
+    assert pushed.status_code == 200
+    assert pushed.json()["sequence"] == 1
+
+    fetched = client.get("/client/vision/frame", headers=auth_headers())
+    assert fetched.status_code == 200
+    body = fetched.json()
+    assert body["frame_base64"] == "ZmFrZS1qcGVn"
+    assert body["width"] == 1280
+
+    pushed_again = client.post(
+        "/client/vision/frame",
+        json={"frame_base64": "c2Vjb25kLWZyYW1l", "sequence": 2},
+        headers=auth_headers(),
+    )
+    assert pushed_again.status_code == 200
+    latest = client.get("/client/vision/frame", headers=auth_headers())
+    assert latest.json()["frame_base64"] == "c2Vjb25kLWZyYW1l"
+
+
 def test_client_action_result_updates_backend_action_state() -> None:
     envelope = client.app.state.action_dispatcher.enqueue(
         user_id="u1",
@@ -2443,6 +2477,65 @@ def test_explicit_search_strips_trailing_topic_relation() -> None:
     assert "%EC%B0%BD%EC%9B%90%EB%8C%80%ED%95%99%EA%B5%90" in action.target
 
 
+def test_browser_search_result_selection_beats_search_template() -> None:
+    from router.router import _local_direct_action_decision
+
+    for context in (
+        {
+            "browser_active": True,
+            "last_query": "openai",
+            "last_url": "https://www.google.com/search?q=openai",
+            "capabilities": ["open_url", "browser.search", "browser.select_result"],
+        },
+        {"capabilities": ["open_url", "browser.search", "browser.select_result"]},
+        None,
+    ):
+        decision = _local_direct_action_decision(
+            "첫번째 검색결과 들어가 줄래?",
+            context=context,
+        )
+
+        assert decision is not None
+        assert decision.intent == "browser.select_result"
+        action = decision.actions[0]
+        assert action.type == "browser_control"
+        assert action.command == "select_result"
+        assert action.args["index"] == 1
+
+
+def test_browser_open_only_does_not_search_polite_suffix() -> None:
+    from router.router import _browser_search_query_from_message, _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "브라우저 열어줘",
+        context={"capabilities": ["browser.open", "browser.search", "open_url"]},
+    )
+
+    assert decision is not None
+    assert decision.intent == "browser.open"
+    action = decision.actions[0]
+    assert action.type == "browser"
+    assert action.command == "open"
+    assert _browser_search_query_from_message("브라우저 열어줘", context=None) is None
+
+
+def test_current_browser_tab_close_dispatches_browser_control() -> None:
+    from router.router import _local_direct_action_decision
+
+    decision = _local_direct_action_decision(
+        "지금 열려있는 탭 닫아줘",
+        context={"capabilities": ["browser.close_tab", "browser_control"]},
+    )
+
+    assert decision is not None
+    assert decision.intent == "browser.close_tab"
+    action = decision.actions[0]
+    assert action.type == "browser_control"
+    assert action.command == "close_tab"
+    assert action.target == "active_tab"
+    assert action.args["browser"] == "chrome"
+
+
 def test_bare_browser_search_without_previous_topic_is_not_dispatched() -> None:
     from router.router import _local_direct_action_decision
 
@@ -2779,16 +2872,21 @@ def test_todo_today_list_filters_server_results(monkeypatch) -> None:
 
     monkeypatch.setattr(stub_core_client, "list_todos", fake_list_todos)
 
-    response = client.post(
-        "/conversation/stream",
-        json={"message": "오늘 할일 알려줘"},
-        headers=auth_headers(),
-    )
+    for message in ("오늘 할일 알려줄래", "할일 목록 리스트업해줄래"):
+        response = client.post(
+            "/conversation/stream",
+            json={"message": message},
+            headers=auth_headers(),
+        )
 
-    assert response.status_code == 200
-    body = response.text
-    assert "오늘 회의" in body
-    assert "내일 회의" not in body
+        assert response.status_code == 200
+        body = response.text
+        assert '"intent": "todo.list"' in body
+        assert "오늘 회의" in body
+        assert f"오늘 {today:%H:%M}" in body
+        assert today.isoformat() not in body
+        if "오늘" in message:
+            assert "내일 회의" not in body
 
 
 def test_free_time_check_lists_today_todos_and_summarizes_slots(monkeypatch) -> None:
@@ -2833,8 +2931,9 @@ def test_free_time_check_lists_today_todos_and_summarizes_slots(monkeypatch) -> 
     assert '"intent": "todo.list"' in body
     assert '"summary_mode": "free_time"' in body
     assert "오늘 할 일 목록 기준 빈 시간입니다." in body
-    assert "10:00-14:00" in body
-    assert "15:00-18:00" in body
+    assert "09:00-10:00" in body
+    assert "11:00-15:00" in body
+    assert "16:00-18:00" in body
 
 
 def test_free_time_check_reports_result_after_empty_todo_action(monkeypatch) -> None:

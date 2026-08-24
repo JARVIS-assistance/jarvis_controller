@@ -399,6 +399,30 @@ def _required_v2_args(
                         field=f"args.{field}",
                     )
                 )
+    elif action.name == "mouse.move":
+        for field in ("x", "y"):
+            if not isinstance(args.get(field), int | float):
+                issues.append(
+                    _issue(
+                        "missing_required_field",
+                        f"mouse.move requires {field}",
+                        action_index=index,
+                        action_name=action.name,
+                        field=f"args.{field}",
+                    )
+                )
+    elif action.name == "mouse.scroll":
+        if not isinstance(args.get("amount"), int | float):
+            issues.append(
+                _issue(
+                    "missing_required_field",
+                    "mouse.scroll requires args.amount",
+                    action_index=index,
+                    action_name=action.name,
+                    field="args.amount",
+                )
+            )
+        require_string("direction")
     elif action.name == "clipboard.copy":
         text = args.get("text") or action.payload
         if not isinstance(text, str) or not text:
@@ -503,8 +527,8 @@ def _capability_candidates(name: str) -> tuple[str, ...]:
         "browser": ("browser_control", "open_url"),
         "app": ("app_control",),
         "keyboard": ("keyboard_type", "hotkey"),
-        "mouse": ("mouse_click", "mouse_drag"),
-        "screen": ("screenshot",),
+        "mouse": ("mouse_click", "mouse_drag", "mouse_move", "mouse_scroll"),
+        "screen": ("screenshot", "screen_stream"),
         "clipboard": ("clipboard",),
         "terminal": ("terminal",),
         "notification": ("notify", "notification"),
@@ -529,7 +553,14 @@ def _v1_capability_candidates(
         "hotkey": ("keyboard", "keyboard.hotkey", "hotkey"),
         "mouse_click": ("mouse", "mouse.click", "mouse_click"),
         "mouse_drag": ("mouse", "mouse.drag", "mouse_drag"),
+        "mouse_move": ("mouse", "mouse.move", "mouse_move"),
+        "mouse_scroll": ("mouse", "mouse.scroll", "mouse_scroll"),
         "screenshot": ("screen", "screen.screenshot", "screenshot"),
+        "screen_stream": (
+            "screen",
+            "screen.describe" if command == "describe" else f"screen.stream_{command or 'start'}",
+            "screen_stream",
+        ),
         "clipboard": ("clipboard", f"clipboard.{command}", "clipboard"),
         "terminal": ("terminal", "terminal.run", "terminal"),
         "notify": ("notification", "notification.show", "notify"),

@@ -116,6 +116,7 @@ def create_app(
     app.state.action_dispatcher = ActionDispatcher()
     app.state.action_context = ActionContextStore()
     app.state.turn_cancellation = TurnCancellationStore()
+    app.state.vision_frames = {}
     app.state.action_dispatcher.context_store = app.state.action_context
     app.state.action_dispatcher.server_action_handler = (
         lambda user_id, request_id, action_id, action: execute_server_action(
@@ -124,6 +125,7 @@ def create_app(
             request_id=request_id,
             action_id=action_id,
             action=action,
+            get_latest_vision_frame=app.state.vision_frames.get,
         )
     )
     app.state.ollama_preload_thread = start_ollama_preload_thread()

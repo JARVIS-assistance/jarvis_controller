@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from jarvis_contracts import ClientAction, ClientActionResult
+
+GetLatestVisionFrame = Callable[[str], dict[str, Any] | None]
 
 
 def execute_server_action(
@@ -14,18 +17,37 @@ def execute_server_action(
     request_id: str,
     action_id: str,
     action: ClientAction,
+    get_latest_vision_frame: GetLatestVisionFrame | None = None,
 ) -> ClientActionResult | None:
-    if action.type != "todo":
+    if action.type == "todo":
+
+        def executor() -> dict[str, object]:
+            return _execute_todo_action(core_client=core_client, user_id=user_id, action=action)
+
+        error_output: dict[str, object] = {"source": "server_todo", "command": action.command}
+    elif action.type == "screen_stream" and action.command == "describe":
+
+        def executor() -> dict[str, object]:
+            return _execute_screen_describe(
+                core_client=core_client,
+                user_id=user_id,
+                action=action,
+                get_latest_vision_frame=get_latest_vision_frame,
+            )
+
+        error_output = {"source": "server_vision", "command": "describe"}
+    else:
         return None
+
     try:
-        output = _execute_todo_action(core_client=core_client, user_id=user_id, action=action)
+        output = executor()
     except Exception as exc:
         return ClientActionResult(
             action_id=action_id,
             request_id=request_id,
             status="failed",
             error=str(exc),
-            output={"source": "server_todo", "command": action.command},
+            output=error_output,
         )
     return ClientActionResult(
         action_id=action_id,
@@ -33,6 +55,41 @@ def execute_server_action(
         status="completed",
         output=output,
     )
+
+
+def _execute_screen_describe(
+    *,
+    core_client: Any,
+    user_id: str,
+    action: ClientAction,
+    get_latest_vision_frame: GetLatestVisionFrame | None,
+) -> dict[str, object]:
+    if get_latest_vision_frame is None:
+        raise ValueError("vision frame lookup is not configured")
+    frame = get_latest_vision_frame(user_id)
+    if not isinstance(frame, dict):
+        raise ValueError(
+            "no screen frame available yet — start screen_stream before describing it"
+        )
+    image_base64 = frame.get("frame_base64")
+    if not isinstance(image_base64, str) or not image_base64.strip():
+        raise ValueError("cached vision frame is empty")
+
+    args = action.args if isinstance(action.args, dict) else {}
+    prompt = args.get("prompt")
+    result = core_client.describe_vision_frame(
+        user_id=user_id,
+        image_base64=image_base64,
+        prompt=prompt if isinstance(prompt, str) and prompt.strip() else None,
+    )
+    return {
+        "source": "server_vision",
+        "command": "describe",
+        "description": result.get("description"),
+        "model": result.get("model"),
+        "frame_captured_at": frame.get("captured_at"),
+        "frame_sequence": frame.get("sequence"),
+    }
 
 
 def _execute_todo_action(
@@ -120,6 +177,7 @@ def _todo_output(
         "command": command,
     }
     if isinstance(result, dict):
+        result = _normalize_todo_result_due_at(result)
         output["result"] = result
         resolved_id = result.get("id") or todo_id
         if isinstance(resolved_id, str):
@@ -135,6 +193,39 @@ def _todo_output(
         if todo_id:
             output["todo_id"] = todo_id
     return output
+
+
+def _normalize_todo_result_due_at(result: dict[str, object]) -> dict[str, object]:
+    """Drop sub-second precision from due_at before it goes out over SSE.
+
+    Microsecond precision is never meaningful for a todo due date and makes
+    the raw payload noisier than the human-readable summary built from it.
+    """
+    normalized = dict(result)
+    if isinstance(result.get("due_at"), str):
+        normalized["due_at"] = _normalize_due_at(result["due_at"])
+    items = result.get("items")
+    if isinstance(items, list):
+        normalized["items"] = [
+            {**item, "due_at": _normalize_due_at(item["due_at"])}
+            if isinstance(item, dict) and isinstance(item.get("due_at"), str)
+            else item
+            for item in items
+        ]
+    return normalized
+
+
+def _normalize_due_at(value: object) -> object:
+    if not isinstance(value, str) or not value.strip():
+        return value
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return value
+    return parsed.replace(microsecond=0).isoformat()
 
 
 def _todo_id(action: ClientAction, args: dict[str, Any]) -> str | None:
