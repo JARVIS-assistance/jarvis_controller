@@ -1453,6 +1453,41 @@ def test_deepthink_watch_streams_and_stops_when_stub_returns_no_actions() -> Non
     assert '"iterations": 1' in body
 
 
+def test_deepthink_watch_start_returns_immediately_and_runs_in_background() -> None:
+    response = client.post(
+        "/deepthink/watch/start",
+        json={"goal": "keep clicking until done"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "started"
+    assert body["goal"] == "keep clicking until done"
+    request_id = body["request_id"]
+
+    # background thread should finish quickly against the stub (empty actions
+    # => stops after one round) and clean itself out of the tracking dict
+    for _ in range(50):
+        if request_id not in client.app.state.background_loops:
+            break
+        time.sleep(0.05)
+    assert request_id not in client.app.state.background_loops
+
+
+def test_autonomous_loop_trigger_phrase_starts_background_loop_and_acks() -> None:
+    response = client.post(
+        "/conversation/stream",
+        json={"message": "이 게임 계속 지켜보면서 대신 플레이해줘"},
+        headers=auth_headers(),
+    )
+
+    assert response.status_code == 200
+    body = response.text
+    assert "event: assistant_delta" in body
+    assert "지켜보면서" in body
+
+
 def test_vision_frame_push_and_fetch_roundtrip() -> None:
     missing = client.get("/client/vision/frame", headers=auth_headers())
     assert missing.status_code == 404

@@ -4,6 +4,7 @@ import logging
 import os
 import queue
 import re
+import threading
 import time
 from collections.abc import Generator
 from datetime import datetime, timedelta
@@ -64,9 +65,11 @@ from planner.action_templates import (
     materialize_fresh_context_app_open_for_text,
     normalize_browser_search_query,
 )
+from planner.autonomous_intent import autonomous_loop_requested
 from planner.autonomous_loop import (
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_MAX_SECONDS,
+    run_autonomous_loop,
     stream_autonomous_loop,
 )
 from planner.conversation_orchestrator import orchestrate_conversation_turn
@@ -3564,6 +3567,20 @@ def _stream_orchestrated_conversation_inner(
     obvious_decision: RoutingDecision | None = None
 
     if route_override in (None, ConversationMode.REALTIME.value):
+        autonomous_goal = autonomous_loop_requested(req.message)
+        if autonomous_goal is not None:
+            _start_background_autonomous_loop(
+                request=request,
+                user_id=principal.user_id,
+                goal=autonomous_goal,
+            )
+            yield from _stream_local_text_response(
+                request_id=request_id,
+                content="알겠습니다, 계속 지켜보면서 진행할게요. 다 되면 알려드릴게요.",
+                reason="autonomous loop started in background",
+            )
+            return
+
         if local_text_response is not None and req.override != ContractConversationMode.PLANNING:
             yield from _stream_local_text_response(
                 request_id=request_id,
@@ -5181,6 +5198,91 @@ def deepthink_watch(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _background_loops(request: Request) -> dict[str, threading.Thread]:
+    cache = getattr(request.app.state, "background_loops", None)
+    if isinstance(cache, dict):
+        return cache
+    request.app.state.background_loops = {}
+    return request.app.state.background_loops
+
+
+def _start_background_autonomous_loop(
+    *,
+    request: Request,
+    user_id: str,
+    goal: str,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    max_seconds: float = DEFAULT_MAX_SECONDS,
+) -> str:
+    """Runs the autonomous loop on a daemon thread, detached from whatever
+    HTTP request triggered it — the caller doesn't need to keep a connection
+    open. Actions still reach the client via the existing action_dispatcher
+    queue / poller; a `notify` action (the loop's own "I'm done" signal)
+    reaches the user the same way. Returns the request_id it's tracked under.
+
+    Deliberately does NOT register with TurnCancellationStore: that store is
+    one-active-turn-per-user (a new turn cancels the previous one, for
+    barge-in) — reusing it here would cancel whatever conversation turn
+    triggered this loop out from under itself. The loop gets its own
+    independent cancel flag instead; it simply runs alongside the normal
+    conversation turn rather than replacing it.
+    """
+    request_id = f"req_{uuid4().hex}"
+    cancel_event = threading.Event()
+
+    def is_cancelled() -> bool:
+        return cancel_event.is_set()
+
+    def run_and_cleanup() -> None:
+        try:
+            run_autonomous_loop(
+                core_client=request.app.state.core_client,
+                action_dispatcher=request.app.state.action_dispatcher,
+                request_id=request_id,
+                user_id=user_id,
+                goal=goal,
+                max_iterations=max_iterations,
+                max_seconds=max_seconds,
+                is_cancelled=is_cancelled,
+            )
+        except Exception:
+            logger.exception(
+                "autonomous loop background thread failed request_id=%s", request_id
+            )
+        finally:
+            _background_loops(request).pop(request_id, None)
+
+    thread = threading.Thread(
+        target=run_and_cleanup, daemon=True, name=f"autonomous-loop-{request_id}"
+    )
+    _background_loops(request)[request_id] = thread
+    thread.start()
+    return request_id
+
+
+@api_router.post(
+    "/deepthink/watch/start",
+    tags=["execution"],
+    summary="Start a bounded observe-act loop in the background",
+)
+def deepthink_watch_start(
+    body: AutonomousLoopRequest,
+    request: Request,
+    _: TokenAuth = None,
+    authorization_header: AuthHeaderDoc = None,
+) -> dict[str, object]:
+    _ = authorization_header
+    principal = request.state.principal
+    request_id = _start_background_autonomous_loop(
+        request=request,
+        user_id=principal.user_id,
+        goal=body.goal,
+        max_iterations=body.max_iterations,
+        max_seconds=body.max_seconds,
+    )
+    return {"request_id": request_id, "status": "started", "goal": body.goal}
 
 
 @api_router.post("/execute", tags=["execution"], summary="Execute action")

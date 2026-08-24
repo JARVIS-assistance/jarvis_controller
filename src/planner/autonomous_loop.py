@@ -119,3 +119,33 @@ def stream_autonomous_loop(
 def _append_step_context(execution_context: list[str], step_results: Any) -> None:
     for step_result in step_results:
         execution_context.append(f"- {step_result.title}: {step_result.content[:500]}")
+
+
+def run_autonomous_loop(
+    *,
+    core_client: Any,
+    action_dispatcher: Any,
+    request_id: str,
+    user_id: str,
+    goal: str,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    max_seconds: float = DEFAULT_MAX_SECONDS,
+    is_cancelled: Callable[[], bool] | None = None,
+) -> None:
+    """Run the same loop as stream_autonomous_loop with nobody reading the SSE
+    bytes — for background/detached execution (e.g. a background thread) where
+    the HTTP request that started it has already returned. Actions still
+    reach the client the same way they always do: dispatched through
+    action_dispatcher, delivered by the client's existing action poller.
+    """
+    for _chunk in stream_autonomous_loop(
+        core_client=core_client,
+        action_dispatcher=action_dispatcher,
+        request_id=request_id,
+        user_id=user_id,
+        goal=goal,
+        max_iterations=max_iterations,
+        max_seconds=max_seconds,
+        is_cancelled=is_cancelled,
+    ):
+        pass
