@@ -165,6 +165,8 @@ _ACTION_OBJECT_TERMS = (
     "사파리",
     "앱",
     "어플",
+    "메모장",
+    "텍스트 편집기",
     "application",
     "app",
     "터미널",
