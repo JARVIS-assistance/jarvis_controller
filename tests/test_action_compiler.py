@@ -16,6 +16,10 @@ def test_browser_search_query_strips_first_result_instruction() -> None:
     ) == "JARVIS"
 
 
+def test_browser_search_query_strips_browser_eul_prefix() -> None:
+    assert normalize_browser_search_query("브라우저에 네이버 검색해줄래?") == "네이버"
+
+
 def test_action_intent_gate_uses_fast_model_defaults(monkeypatch) -> None:
     monkeypatch.setenv("JARVIS_ACTION_MODEL_PROVIDER", "openai_compat")
     monkeypatch.delenv("JARVIS_ACTION_INTENT_MODEL_TIMEOUT_SECONDS", raising=False)

@@ -19,7 +19,7 @@ class TemplateMaterialization:
 
 _SEARCH_QUERY_PREFIX_PATTERNS = (
     re.compile(
-        r"^\s*(?:브라우저|크롬|chrome|browser)\s*(?:를|을|에서|로)?\s*"
+        r"^\s*(?:브라우저|크롬|chrome|browser)\s*(?:를|을|에서|로|에)?\s*"
         r"(?:(?:열어서|열어|열고|켜서|켜고|실행해서|실행하고)|"
         r"(?:open|launch)(?:\s+the)?)?\s*(?:에서|로)?\s*",
         re.IGNORECASE,
