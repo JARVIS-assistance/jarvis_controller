@@ -359,9 +359,9 @@ class ActionCompiler:
                 if search_decision is not None:
                     return search_decision
                 return ActionIntentDecision(
-                    should_act=False,
-                    execution_mode="no_action",
-                    intent="none",
+                    should_act=True,
+                    execution_mode="invalid",
+                    intent=gate.intent or "action",
                     confidence=gate.confidence,
                     reason="ungrounded app action",
                     actions=[],
@@ -370,9 +370,9 @@ class ActionCompiler:
                 )
             if _gate_lacks_action_template(gate):
                 return ActionIntentDecision(
-                    should_act=False,
-                    execution_mode="no_action",
-                    intent="none",
+                    should_act=True,
+                    execution_mode="invalid",
+                    intent=gate.intent or "action",
                     confidence=gate.confidence,
                     reason="action gate lacked a supported template",
                     actions=[],
@@ -406,9 +406,9 @@ class ActionCompiler:
                 if search_decision is not None:
                     return search_decision
                 return ActionIntentDecision(
-                    should_act=False,
-                    execution_mode="no_action",
-                    intent="none",
+                    should_act=True,
+                    execution_mode="invalid",
+                    intent=gate.intent or "action",
                     confidence=gate.confidence,
                     reason="ungrounded app action",
                     actions=[],

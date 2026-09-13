@@ -2227,6 +2227,14 @@ def _stream_realtime_with_action_arbitration(
                 )
             )
             return chunks, True
+        if _is_unavailable_action_decision(decision):
+            chunks.extend(
+                _stream_unavailable_action_decision(
+                    decision=decision,
+                    request_id=request_id,
+                )
+            )
+            return chunks, True
         return chunks, False
 
     try:
@@ -3175,6 +3183,8 @@ def _action_intent_payload(
     if validation_errors:
         payload["failure_reason"] = "backend_validation_failed"
         payload["validation_errors"] = validation_errors
+    elif decision.execution_mode == "invalid":
+        payload["failure_reason"] = "action_unavailable"
     return payload
 
 
@@ -3183,6 +3193,51 @@ def _is_direct_action_decision(decision: ActionIntentDecision | None) -> bool:
         decision is not None
         and decision.execution_mode in DIRECT_EXECUTION_MODES
         and bool(decision.actions)
+    )
+
+
+def _is_unavailable_action_decision(decision: ActionIntentDecision | None) -> bool:
+    if decision is None:
+        return False
+    if decision.execution_mode == "invalid":
+        return True
+    return (
+        decision.should_act
+        and not decision.actions
+        and decision.reason in {
+            "action gate lacked a supported template",
+            "ungrounded app action",
+        }
+    )
+
+
+def _stream_unavailable_action_decision(
+    *,
+    decision: ActionIntentDecision,
+    request_id: str,
+) -> Generator[bytes, None, None]:
+    reason = _action_decision_reason(decision)
+    yield _sse_event(
+        "plan_step",
+        {
+            "id": f"{request_id}:action-unavailable",
+            "title": "액션 실행 불가",
+            "description": reason,
+            "status": "failed",
+        },
+    )
+    yield _sse_event(
+        "assistant_done",
+        {
+            "content": f"요청은 작업으로 인식했지만 실행할 수 없습니다. {reason}",
+            "summary": "client action unavailable",
+            "status": "failed",
+            "failure_reason": "action_unavailable",
+            "has_actions": False,
+            "action_count": 0,
+            "action_results": [],
+            "error": reason,
+        },
     )
 
 
@@ -3719,6 +3774,13 @@ def _stream_orchestrated_conversation_inner(
                 request_id=request_id,
                 user_id=principal.user_id,
                 action_dispatcher=request.app.state.action_dispatcher,
+            )
+            return
+
+        if _is_unavailable_action_decision(action_decision):
+            yield from _stream_unavailable_action_decision(
+                decision=action_decision,
+                request_id=request_id,
             )
             return
 

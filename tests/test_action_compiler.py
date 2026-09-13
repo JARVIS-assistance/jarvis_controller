@@ -395,8 +395,8 @@ def test_action_compiler_does_not_plan_compile_template_free_gate(
     decision = ActionCompiler().compile_decision(message="안녕?")
 
     assert decision is not None
-    assert decision.should_act is False
-    assert decision.execution_mode == "no_action"
+    assert decision.should_act is True
+    assert decision.execution_mode == "invalid"
     assert decision.reason == "action gate lacked a supported template"
     assert calls == 1
 
@@ -1684,8 +1684,8 @@ def test_action_compiler_rejects_ungrounded_app_template(monkeypatch) -> None:
     )
 
     assert decision is not None
-    assert decision.should_act is False
-    assert decision.execution_mode == "no_action"
+    assert decision.should_act is True
+    assert decision.execution_mode == "invalid"
 
 
 def test_action_compiler_recovers_browser_search_for_app_followup_no_action_gate(
