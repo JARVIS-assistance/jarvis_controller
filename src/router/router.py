@@ -996,6 +996,10 @@ def _looks_like_direct_client_action_request(
         return True
     if _terminal_command_from_message(text, context=context) is not None:
         return True
+    if any(term in folded for term in ("입력", "타이핑", "작성", "type", "write")) and any(
+        marker in folded for marker in ("에 ", "에서 ", "으로 ", "로 ")
+    ):
+        return True
     if _todo_create_action_from_message(text) is not None:
         return True
     if _todo_delete_action_from_message(text) is not None:
