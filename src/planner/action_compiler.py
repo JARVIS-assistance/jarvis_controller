@@ -25,6 +25,7 @@ from planner.action_gate import (
 )
 from planner.action_model_client import (
     action_compiler_model_name,
+    action_repair_model_name,
     action_intent_model_name,
     action_model_endpoint,
     action_model_provider,
@@ -101,6 +102,7 @@ class ActionCompiler:
         latest_observation: dict[str, Any] | None = None,
         validation_errors: list[ClientActionValidationIssue] | None = None,
         intent_gate: ActionIntentGate | None = None,
+        model_name: str | None = None,
     ) -> ClientActionPlan | None:
         if not message.strip():
             return ClientActionPlan(
@@ -110,7 +112,7 @@ class ActionCompiler:
             return None
 
         endpoint = action_model_endpoint()
-        model = action_compiler_model_name()
+        model = model_name or action_compiler_model_name()
         provider = action_model_provider()
         timeout = _float_env("JARVIS_ACTION_COMPILER_MODEL_TIMEOUT_SECONDS", 20.0)
         max_tokens = int(_float_env("JARVIS_ACTION_COMPILER_MODEL_MAX_TOKENS", 320))
@@ -351,6 +353,14 @@ class ActionCompiler:
             if template_decision is not None:
                 return template_decision
             if _gate_is_ungrounded_app_template(gate, message=message, context=context):
+                repair = self._repair_action_plan(
+                    message=message,
+                    context=context,
+                    latest_observation=latest_observation,
+                    intent_gate=gate,
+                )
+                if repair is not None:
+                    return self._decision_from_plan(repair, message=message, context=context)
                 search_decision = self._decision_from_explicit_browser_search_text(
                     message,
                     confidence=gate.confidence,
@@ -369,6 +379,14 @@ class ActionCompiler:
                     validation_errors=[],
                 )
             if _gate_lacks_action_template(gate):
+                repair = self._repair_action_plan(
+                    message=message,
+                    context=context,
+                    latest_observation=latest_observation,
+                    intent_gate=gate,
+                )
+                if repair is not None:
+                    return self._decision_from_plan(repair, message=message, context=context)
                 return ActionIntentDecision(
                     should_act=True,
                     execution_mode="invalid",
@@ -757,6 +775,40 @@ class ActionCompiler:
             )
             retries_left -= 1
         return decision
+
+    def _repair_action_plan(
+        self,
+        *,
+        message: str,
+        context: dict[str, Any] | None,
+        latest_observation: dict[str, Any] | None,
+        intent_gate: ActionIntentGate,
+    ) -> ClientActionPlan | None:
+        if os.getenv("JARVIS_ACTION_REPAIR_ENABLED", "0").lower() in {
+            "0",
+            "false",
+            "off",
+            "no",
+        }:
+            return None
+        plan = self.compile_plan(
+            message=message,
+            context=context,
+            latest_observation=latest_observation,
+            intent_gate=intent_gate,
+            validation_errors=[
+                _issue(
+                    "action_repair",
+                    "The fast gate identified an operation; build the smallest "
+                    "valid executable plan.",
+                    field="mode",
+                )
+            ],
+            model_name=action_repair_model_name(),
+        )
+        if plan is None or plan.mode == "no_action" or not plan.actions:
+            return None
+        return plan
 
     def _decision_from_fresh_context_app_preference(
         self,

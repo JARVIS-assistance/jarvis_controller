@@ -7,7 +7,13 @@ from planner.action_compiler import (
     _parse_intent_gate,
     _parse_plan,
 )
-from planner.action_templates import fast_action_templates
+from planner.action_templates import fast_action_templates, normalize_browser_search_query
+
+
+def test_browser_search_query_strips_first_result_instruction() -> None:
+    assert normalize_browser_search_query(
+        "네이버에서 JARVIS 검색해서 첫 번째 결과를 열어줘"
+    ) == "JARVIS"
 
 
 def test_action_intent_gate_uses_fast_model_defaults(monkeypatch) -> None:

@@ -91,6 +91,12 @@ def normalize_browser_search_query(text: str) -> str:
     query = original
     for pattern in _SEARCH_QUERY_PREFIX_PATTERNS:
         query = pattern.sub("", query).strip()
+    query = re.sub(
+        r"\s*(?:검색해서|검색하고|찾아서|찾고)\s*(?:첫|1)\s*(?:번째\s*)?(?:결과|링크)\s*(?:를\s*)?(?:열어|열|들어가)(?:줘| 줘)?\s*[.!?。]*$",
+        "",
+        query,
+        flags=re.IGNORECASE,
+    ).strip()
     for pattern in _SEARCH_QUERY_SUFFIX_PATTERNS:
         query = pattern.sub("", query).strip()
     for pattern in _SEARCH_TOPIC_TRAILING_RELATION_PATTERNS:
@@ -1082,9 +1088,17 @@ def _explicit_application_open_target_for_text(
     text: str,
     context: dict[str, Any] | None,
 ) -> str | None:
-    if not _looks_like_application_open_request(text):
+    matched = _matching_application_for_text(text, context)
+    if matched is None:
         return None
-    return _matching_application_for_text(text, context)
+    if _looks_like_application_open_request(text):
+        return matched
+    # Installed app aliases (for example "sublimetext") are actionable even
+    # when the user omits the generic word "앱".
+    folded = text.casefold()
+    if any(term in folded for term in ("열어", "켜", "실행", "open", "launch", "start")):
+        return matched
+    return None
 
 
 def _looks_like_application_open_request(text: str) -> bool:

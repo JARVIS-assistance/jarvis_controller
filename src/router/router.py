@@ -2238,6 +2238,20 @@ def _stream_realtime_with_action_arbitration(
         return chunks, False
 
     try:
+        if action_candidate:
+            yield _sse_event(
+                "action_intent",
+                {
+                    "should_act": True,
+                    "execution_mode": "pending",
+                    "intent": None,
+                    "confidence": 0.0,
+                    "reason": "action gate running",
+                    "stage": "gate",
+                    "status": "in_progress",
+                    "action_count": 0,
+                },
+            )
         for chunk in _stream_with_embedded_action_intercept(
             stream,
             request_id=request_id,
@@ -3166,6 +3180,8 @@ def _action_intent_payload(
             "reason": "sLLM action classifier unavailable" if unavailable else None,
             "failure_reason": "compiler_unavailable" if unavailable else None,
             "action_count": 0,
+            "stage": "failed",
+            "status": "failed",
         }
     payload: dict[str, object] = {
         "should_act": decision.should_act,
@@ -3174,6 +3190,8 @@ def _action_intent_payload(
         "confidence": decision.confidence,
         "reason": decision.reason,
         "action_count": len(decision.actions),
+        "stage": "failed" if decision.execution_mode == "invalid" else ("planning" if decision.should_act else "complete"),
+        "status": "failed" if decision.execution_mode == "invalid" else "complete",
     }
     validation_errors = [
         issue.model_dump()

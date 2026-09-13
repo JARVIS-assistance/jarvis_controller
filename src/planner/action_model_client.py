@@ -50,6 +50,14 @@ def action_compiler_model_name() -> str:
     )
 
 
+def action_repair_model_name() -> str:
+    return (
+        os.getenv("JARVIS_ACTION_REPAIR_MODEL_NAME")
+        or os.getenv("JARVIS_ACTION_REPAIR_MODEL")
+        or "qwen2.5:7b"
+    )
+
+
 def complete_model_text(
     *,
     provider: str,
